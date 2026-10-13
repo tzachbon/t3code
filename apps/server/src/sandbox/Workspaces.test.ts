@@ -231,6 +231,29 @@ it.effect(
     }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect("browser access honors bounded jobs and rejects a replaced generation", () =>
+  Effect.gen(function* () {
+    const service = yield* Workspaces.Workspaces;
+    const initial = yield* service.start("browser-lease", "first");
+    yield* service.registerJob({
+      threadId: "browser-lease",
+      requestId: "long-job",
+      requestHash: "d".repeat(64),
+      deadline: initial.absoluteExpiresAt,
+      purpose: "foreground",
+    });
+    yield* TestClock.adjust("31 minutes");
+    yield* service.assertRunning("browser-lease", initial.generation);
+    yield* service.stop("browser-lease", "user");
+    const replacement = yield* service.start("browser-lease", "replacement");
+    assert.equal(
+      (yield* service.assertRunning("browser-lease", initial.generation).pipe(Effect.result))._tag,
+      "Failure",
+    );
+    yield* service.assertRunning("browser-lease", replacement.generation);
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("passive status reads do not renew idle expiry, while a bounded job does", () =>
   Effect.gen(function* () {
     const service = yield* Workspaces.Workspaces;

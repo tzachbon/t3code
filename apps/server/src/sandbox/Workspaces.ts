@@ -211,6 +211,10 @@ export class Workspaces extends Context.Service<
       requestId: string,
     ) => Effect.Effect<WorkspaceStatus, WorkspaceError>;
     readonly status: (threadId: string) => Effect.Effect<WorkspaceStatus | null, WorkspaceError>;
+    readonly assertRunning: (
+      threadId: string,
+      generation?: number,
+    ) => Effect.Effect<void, WorkspaceError>;
     readonly sandbox: (threadId: string) => Effect.Effect<Sandbox, WorkspaceError>;
     readonly touch: (threadId: string) => Effect.Effect<WorkspaceStatus, WorkspaceError>;
     readonly stop: (
@@ -364,10 +368,29 @@ const make = Effect.gen(function* () {
       instant = to;
     }
   });
-  const requireRunning = Effect.fnUntraced(function* (threadId: string) {
+  const requireRunning = Effect.fnUntraced(function* (threadId: string, generation?: number) {
     const row = yield* latest(threadId);
     const now = yield* Clock.currentTimeMillis;
-    if (!row || row.state !== "running" || !row.sandbox_id || row.expires_at <= now) {
+    if (!enabled()) return yield* new WorkspaceError({ reason: "disabled" });
+    const [settings] = yield* db(
+      sql<{ frozen_until: number }>`SELECT frozen_until FROM depot_workspace_manager`,
+    );
+    if ((settings?.frozen_until ?? Infinity) > now)
+      return yield* new WorkspaceError({ reason: "budget" });
+    if (
+      !row ||
+      row.state !== "running" ||
+      !row.sandbox_id ||
+      row.expires_at <= now ||
+      row.absolute_expires_at <= now ||
+      (generation !== undefined && generation !== row.generation)
+    ) {
+      return yield* new WorkspaceError({ reason: "not-running" });
+    }
+    const [jobs] = yield* db(sql<{ deadline: number | null }>`SELECT MAX(deadline) AS deadline
+      FROM depot_workspace_jobs WHERE thread_id=${threadId} AND generation=${row.generation}
+      AND state='running' AND deadline>${now}`);
+    if (Math.max(row.idle_expires_at, jobs?.deadline ?? 0) <= now) {
       return yield* new WorkspaceError({ reason: "not-running" });
     }
     return row;
@@ -850,6 +873,8 @@ const make = Effect.gen(function* () {
     start,
     status,
     stop,
+    assertRunning: (threadId, generation) =>
+      requireRunning(threadId, generation).pipe(Effect.asVoid),
     sandbox: Effect.fn("Workspaces.sandbox")(function* (threadId) {
       const row = yield* requireRunning(threadId);
       const resource = yield* depot.get(row.sandbox_id!);
