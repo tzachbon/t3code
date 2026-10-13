@@ -10,6 +10,7 @@ import {
   PreviewNavStatus,
   PreviewSessionSnapshot,
   PreviewViewportSetting,
+  PreviewError,
 } from "./preview.ts";
 import {
   PreviewAutomationHost,
@@ -21,6 +22,7 @@ import {
 } from "./previewAutomation.ts";
 
 const decodePreviewEvent = Schema.decodeUnknownSync(PreviewEvent);
+const decodePreviewError = Schema.decodeUnknownSync(PreviewError);
 const decodeSnapshot = Schema.decodeUnknownSync(PreviewSessionSnapshot);
 const decodeNavStatus = Schema.decodeUnknownSync(PreviewNavStatus);
 const decodeServer = Schema.decodeUnknownSync(DiscoveredLocalServer);
@@ -95,6 +97,8 @@ describe("PreviewSessionSnapshot", () => {
     });
     expect(snapshot.tabId).toBe("preview-thread-1");
     expect(snapshot.navStatus._tag).toBe("Success");
+    expect(snapshot.workspace).toBeUndefined();
+    expect(snapshot.executionLocation).toBeUndefined();
   });
 });
 
@@ -360,5 +364,17 @@ describe("ConfiguredLocalServerUrls", () => {
     expect(() =>
       decodeConfiguredLocalServerUrls([`http://localhost/${"a".repeat(PREVIEW_URL_MAX_LENGTH)}`]),
     ).toThrow();
+  });
+});
+
+describe("PreviewWorkspaceError", () => {
+  it("decodes a bounded public failure without internal vendor details", () => {
+    const error = decodePreviewError({
+      _tag: "PreviewWorkspaceError",
+      reason: "budget",
+    });
+    expect(error._tag).toBe("PreviewWorkspaceError");
+    expect(error.message).toBe("The monthly remote workspace budget is exhausted.");
+    expect(error).not.toHaveProperty("cause");
   });
 });

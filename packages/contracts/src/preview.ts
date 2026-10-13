@@ -194,10 +194,26 @@ export const PreviewStreamHostSetup = Schema.Struct({
 export type PreviewStreamHostSetup = typeof PreviewStreamHostSetup.Type;
 export const PREVIEW_STREAM_HOST_SETUP_CLOSE_CODE = 4503;
 
+/** Public workspace lifecycle and metered compute; contains no vendor or connection identifiers. */
+export const PreviewWorkspaceStatus = Schema.Struct({
+  state: Schema.Literals(["creating", "running", "stop-pending", "stopped", "expired"]),
+  generation: NonNegativeInt,
+  expiresAt: Schema.Number,
+  idleExpiresAt: Schema.Number,
+  absoluteExpiresAt: Schema.Number,
+  accruedMicroUsd: NonNegativeInt,
+  reservedMicroUsd: NonNegativeInt,
+  remainingMicroUsd: NonNegativeInt,
+  reason: Schema.NullOr(Schema.String),
+});
+export type PreviewWorkspaceStatus = typeof PreviewWorkspaceStatus.Type;
+
 export const PreviewSessionSnapshot = Schema.Struct({
   threadId: TrimmedNonEmptyString,
   tabId: PreviewTabId,
   navStatus: PreviewNavStatus,
+  workspace: Schema.optional(PreviewWorkspaceStatus),
+  executionLocation: Schema.optional(Schema.Literal("depot")),
   canGoBack: Schema.Boolean,
   canGoForward: Schema.Boolean,
   /** Missing snapshots from older servers are treated as fill-panel mode. */
@@ -280,6 +296,8 @@ export type PreviewResizeInput = typeof PreviewResizeInput.Type;
 export const PreviewAdjustInput = Schema.Struct({
   threadId: ThreadId,
   tabId: PreviewTabId,
+  workspaceAction: Schema.optional(Schema.Literals(["status", "stop", "recreate"])),
+  workspaceRequestId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
   colorScheme: Schema.optional(PreviewAppearancePreference),
   zoomFactor: Schema.optional(PreviewZoomFactor),
   /** Reloads the page past its cache, as Chrome's Shift+Reload does. */
@@ -452,9 +470,42 @@ export class PreviewClearProfileError extends Schema.TaggedError<PreviewClearPro
   }
 }
 
+export class PreviewWorkspaceError extends Schema.TaggedError<PreviewWorkspaceError>()(
+  "PreviewWorkspaceError",
+  {
+    reason: Schema.Literals([
+      "disabled",
+      "budget",
+      "not-running",
+      "invalid-input",
+      "request-conflict",
+      "provider",
+      "persistence",
+    ]),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "budget":
+        return "The monthly remote workspace budget is exhausted.";
+      case "not-running":
+        return "This workspace stopped or expired. Recreate it to continue.";
+      case "disabled":
+        return "Remote workspaces are unavailable.";
+      case "invalid-input":
+        return "The remote workspace request is invalid.";
+      case "request-conflict":
+        return "This request ID was already used for a different workspace request.";
+      default:
+        return "The remote workspace operation failed. Try again.";
+    }
+  }
+}
+
 export const PreviewError = Schema.Union([
   PreviewSessionLookupError,
   PreviewInvalidUrlError,
   PreviewControlRequiredError,
+  PreviewWorkspaceError,
 ]);
 export type PreviewError = typeof PreviewError.Type;

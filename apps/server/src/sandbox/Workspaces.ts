@@ -188,7 +188,7 @@ export interface WorkspaceStatus {
   remainingMicroUsd: number;
   reason: string | null;
   sourceSnapshot: string | null;
-  remoteRoot: "/workspace";
+  remoteRoot: "/tmp/t3/workspace";
 }
 export interface WorkspaceJob {
   threadId: string;
@@ -240,6 +240,7 @@ export class Workspaces extends Context.Service<
     readonly setSourceSnapshot: (
       threadId: string,
       sourceSnapshot: string,
+      generation?: number,
     ) => Effect.Effect<void, WorkspaceError>;
     readonly reconcile: Effect.Effect<void, WorkspaceError>;
   }
@@ -343,7 +344,7 @@ const make = Effect.gen(function* () {
       remainingMicroUsd: costs.remaining,
       reason: row.reason,
       sourceSnapshot: row.source_snapshot,
-      remoteRoot: "/workspace" as const,
+      remoteRoot: "/tmp/t3/workspace" as const,
     };
   });
   const status = Effect.fn("Workspaces.status")(function* (threadId: string) {
@@ -579,7 +580,7 @@ const make = Effect.gen(function* () {
               row.absolute_expires_at,
               Math.max(row.idle_expires_at, jobs?.deadline ?? 0),
             );
-            if (target <= now) return { row, requestedExpiry: now };
+            if (target <= now) return { row, requestedExpiry: now, timeoutMinutes: 0 };
             // Reserve before issuing the RPC, including an uncertain/lost renewal response.
             const timeoutMinutes = Math.min(
               Math.ceil((target - now) / 60_000),
@@ -591,12 +592,12 @@ const make = Effect.gen(function* () {
             );
             yield* admit(row, now);
             yield* save(row);
-            return { row, requestedExpiry: now + timeoutMinutes * 60_000 };
+            return { row, requestedExpiry: now + timeoutMinutes * 60_000, timeoutMinutes };
           }),
         )
         .pipe(db),
     );
-    const { row, requestedExpiry } = pending;
+    const { row, requestedExpiry, timeoutMinutes } = pending;
     const now = yield* Clock.currentTimeMillis;
     if (row.idle_expires_at <= now) {
       const [jobs] = yield* db(sql<{
@@ -613,7 +614,7 @@ const make = Effect.gen(function* () {
       return yield* statusOf(row);
     }
     const renewed = yield* depot
-      .renew(row.sandbox_id!, Math.floor((requestedExpiry - now) / 60_000))
+      .renew(row.sandbox_id!, timeoutMinutes)
       .pipe(Effect.match({ onSuccess: (value) => value, onFailure: () => null }));
     if (!renewed) yield* stopRow(row, "renewal-unconfirmed");
     else {
@@ -892,13 +893,15 @@ const make = Effect.gen(function* () {
     finishJob,
     job,
     setSourceSnapshot: Effect.fn("Workspaces.setSourceSnapshot")(
-      function* (threadId, sourceSnapshot) {
+      function* (threadId, sourceSnapshot, generation) {
         if (!/^[a-zA-Z0-9._-]{1,200}$/.test(sourceSnapshot))
           return yield* new WorkspaceError({ reason: "invalid-input" });
-        const row = yield* requireRunning(threadId);
+        const row = yield* requireRunning(threadId, generation);
         yield* update(row.name, (current) =>
-          Effect.sync(() => {
-            if (current.state === "running") current.source_snapshot = sourceSnapshot;
+          Effect.gen(function* () {
+            if (current.state !== "running")
+              return yield* new WorkspaceError({ reason: "not-running" });
+            current.source_snapshot = sourceSnapshot;
           }),
         );
       },

@@ -66,6 +66,7 @@ import {
   subscribeBrowserViewportChange,
 } from "~/browser/browserViewportActions";
 import { browserResponsiveViewportForToggle, useBrowserDefaults } from "~/browser/browserDefaults";
+import { BrowserWorkspaceControls } from "~/browser/BrowserWorkspaceControls";
 import { BrowserDeviceToolbar } from "~/browser/BrowserDeviceToolbar";
 import { BROWSER_DEVICE_TOOLBAR_HEIGHT } from "~/browser/browserViewportLayout";
 import { previewRuntimeTabId } from "~/browser/previewRuntimeTabId";
@@ -207,6 +208,11 @@ export function PreviewView({
   // desktop app's own server's tabs, which render here natively while the server drives them.
   const nativeServerTab = useRendersServerTabNatively(threadRef.environmentId, snapshot);
   const isServerTab = snapshot?.runtime === "server" && !nativeServerTab;
+  const workspaceUnavailable =
+    snapshot?.executionLocation === "depot" &&
+    (snapshot.workspace?.state === "stopped" ||
+      snapshot.workspace?.state === "expired" ||
+      snapshot.workspace?.state === "stop-pending");
   /** The server owns this tab's appearance, zoom, and size, whoever renders it. */
   const serverOwnsRendering = snapshot?.runtime === "server";
   const serverSurfaceRef = useRef<ServerBrowserHandle | null>(null);
@@ -1048,8 +1054,19 @@ export function PreviewView({
         }
       />
 
+      {snapshot?.executionLocation === "depot" ? (
+        <BrowserWorkspaceControls
+          environmentId={threadRef.environmentId}
+          tab={snapshot}
+          visible={visible}
+        />
+      ) : null}
       <div ref={serverBodyRef} className="relative min-h-0 flex-1 overflow-hidden">
-        {runtimeTabId && snapshot && isServerTab ? (
+        {workspaceUnavailable ? (
+          <div className="flex h-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
+            This workspace is {snapshot.workspace?.state}. Recreate it to continue.
+          </div>
+        ) : runtimeTabId && snapshot && isServerTab ? (
           <>
             {viewport._tag !== "fill" && !showEmptyState && !isUnreachable ? (
               <div className="absolute inset-x-0 top-0 z-10">
@@ -1102,7 +1119,7 @@ export function PreviewView({
             </div>
           )
         ) : null}
-        {showEmptyState ? (
+        {showEmptyState && !workspaceUnavailable ? (
           <PreviewEmptyState
             threadRef={threadRef}
             environmentId={threadRef.environmentId}
@@ -1126,7 +1143,7 @@ export function PreviewView({
             controller={controller}
           />
         ) : null}
-        {navStatus._tag === "LoadFailed" && navStatus.download ? (
+        {!workspaceUnavailable && navStatus._tag === "LoadFailed" && navStatus.download ? (
           <div className="absolute inset-0 z-10 bg-background">
             <ServerTabFileNotShown
               threadRef={threadRef}
@@ -1135,7 +1152,7 @@ export function PreviewView({
               download={navStatus.download}
             />
           </div>
-        ) : navStatus._tag === "LoadFailed" ? (
+        ) : !workspaceUnavailable && navStatus._tag === "LoadFailed" ? (
           <div className="absolute inset-0 z-10 bg-background">
             <PreviewUnreachable
               url={navStatus.url}

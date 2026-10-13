@@ -47,6 +47,8 @@ import {
 } from "./toolkits/preview/tools.ts";
 import * as WorktreeHandlers from "./toolkits/worktree/handlers.ts";
 import { WorktreeToolkit } from "./toolkits/worktree/tools.ts";
+import * as SandboxHandlers from "./toolkits/sandbox/handlers.ts";
+import { SandboxToolkit } from "./toolkits/sandbox/tools.ts";
 import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
@@ -875,6 +877,7 @@ export const layer = Layer.mergeAll(
   layerEnvironmentToolkit,
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,
+  toolkitRegistration(SandboxToolkit, SandboxHandlers.layer),
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,

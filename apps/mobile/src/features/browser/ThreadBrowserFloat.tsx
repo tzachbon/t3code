@@ -54,7 +54,15 @@ export function ThreadBrowserFloat(props: {
     onOpen(tabId);
   }, [onOpen, tabId]);
   const close = useCallback(() => setTabId(null), []);
-  if (!tab || !focused) return null;
+  if (
+    !tab ||
+    !focused ||
+    (tab.executionLocation === "depot" &&
+      (tab.workspace?.state === "stopped" ||
+        tab.workspace?.state === "expired" ||
+        tab.workspace?.state === "stop-pending"))
+  )
+    return null;
   return (
     <FloatingBrowserPlayer
       environmentId={props.environmentId}

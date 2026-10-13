@@ -25,6 +25,7 @@ import {
   FILL_PREVIEW_VIEWPORT,
   PreviewSessionLookupError,
   type PreviewSessionSnapshot,
+  type PreviewWorkspaceStatus,
 } from "@t3tools/contracts";
 import {
   isPreviewUrlNormalizationError,
@@ -48,6 +49,7 @@ export class PreviewManager extends Context.Service<
     readonly open: (
       input: PreviewOpenInput & {
         readonly automationOwner?: string;
+        readonly executionLocation?: "depot";
         /** Runs before the `opened` event publishes, so subscribers find state keyed by the tab. */
         readonly beforePublish?: (snapshot: PreviewSessionSnapshot) => void;
       },
@@ -70,7 +72,7 @@ export class PreviewManager extends Context.Service<
      * the page renders, not what it does.
      */
     readonly adjust: (
-      input: PreviewAdjustInput,
+      input: PreviewAdjustInput & { readonly workspace?: PreviewWorkspaceStatus },
     ) => Effect.Effect<PreviewSessionSnapshot, PreviewError>;
     readonly refresh: (input: PreviewRefreshInput) => Effect.Effect<void, PreviewError>;
     readonly close: (input: PreviewCloseInput) => Effect.Effect<void, PreviewError>;
@@ -221,6 +223,9 @@ export const make = Effect.gen(function* PreviewManagerMake() {
         viewport: input.viewport ?? FILL_PREVIEW_VIEWPORT,
         ...(input.profileId === undefined ? {} : { profileId: input.profileId }),
         ...(runtime === undefined ? {} : { runtime }),
+        ...(input.executionLocation === undefined
+          ? {}
+          : { executionLocation: input.executionLocation }),
         ...(runtime === "server" && input.automationOwner !== undefined
           ? { automationOwner: input.automationOwner }
           : {}),
@@ -374,8 +379,22 @@ export const make = Effect.gen(function* PreviewManagerMake() {
         input.tabId,
         Effect.fn("PreviewManager.adjustSession")(function* (session) {
           const updatedAt = yield* currentIsoTimestamp;
+          const previous = session.snapshot.workspace;
+          const incoming = input.workspace;
+          const staleWorkspace =
+            previous &&
+            incoming &&
+            (incoming.generation < previous.generation ||
+              (incoming.generation === previous.generation &&
+                ((previous.state !== "creating" && incoming.state === "creating") ||
+                  (previous.state !== "running" &&
+                    previous.state !== "creating" &&
+                    incoming.state === "running") ||
+                  ((previous.state === "stopped" || previous.state === "expired") &&
+                    incoming.state === "stop-pending"))));
           const snapshot: PreviewSessionSnapshot = {
             ...session.snapshot,
+            ...(incoming === undefined || staleWorkspace ? {} : { workspace: incoming }),
             ...(input.colorScheme === undefined ? {} : { colorScheme: input.colorScheme }),
             ...(input.zoomFactor === undefined ? {} : { zoomFactor: input.zoomFactor }),
             updatedAt,

@@ -3,6 +3,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
@@ -70,6 +71,28 @@ const testLayer = Workspaces.layer.pipe(
   Layer.provide(NodeCrypto.layer),
   Layer.provide(depot),
   Layer.provide(Layer.effectDiscard(migration).pipe(Layer.provideMerge(database))),
+);
+
+it.effect("renewal preserves the full idle lease when the clock advances during persistence", () =>
+  Effect.gen(function* () {
+    const baseClock = yield* Clock.Clock;
+    let now = yield* Clock.currentTimeMillis;
+    const currentTimeMillis = () => ++now;
+    yield* Effect.gen(function* () {
+      const service = yield* Workspaces.Workspaces;
+      yield* service.start("advancing-clock", "start");
+      const renewed = yield* service.touch("advancing-clock");
+      assert.isAtLeast(renewed.expiresAt, renewed.idleExpiresAt);
+      yield* service.assertRunning("advancing-clock", renewed.generation);
+    }).pipe(
+      Effect.provide(testLayer),
+      Effect.provideService(Clock.Clock, {
+        ...baseClock,
+        currentTimeMillisUnsafe: currentTimeMillis,
+        currentTimeMillis: Effect.sync(currentTimeMillis),
+      }),
+    );
+  }),
 );
 
 it.effect("a late renewal from a stopped generation cannot modify its replacement", () =>
@@ -250,6 +273,13 @@ it.effect("browser access honors bounded jobs and rejects a replaced generation"
       (yield* service.assertRunning("browser-lease", initial.generation).pipe(Effect.result))._tag,
       "Failure",
     );
+    assert.equal(
+      (yield* service
+        .setSourceSnapshot("browser-lease", "old-source", initial.generation)
+        .pipe(Effect.result))._tag,
+      "Failure",
+    );
+    assert.isNull((yield* service.status("browser-lease"))?.sourceSnapshot);
     yield* service.assertRunning("browser-lease", replacement.generation);
   }).pipe(Effect.provide(testLayer)),
 );

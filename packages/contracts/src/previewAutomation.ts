@@ -4,6 +4,7 @@ import { EnvironmentId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts
 import {
   PREVIEW_VIEWPORT_MAX_AREA,
   PreviewRenderedViewportSize,
+  PreviewWorkspaceStatus,
   PreviewTabId,
   PreviewViewportPresetId,
   PreviewViewportSetting,
@@ -86,6 +87,7 @@ export const PreviewAutomationProfile = Schema.Struct({
 export type PreviewAutomationProfile = typeof PreviewAutomationProfile.Type;
 
 export const PreviewAutomationStatus = Schema.Struct({
+  workspace: Schema.optional(PreviewWorkspaceStatus),
   available: Schema.Boolean,
   visible: Schema.Boolean,
   tabId: Schema.NullOr(PreviewTabId),
