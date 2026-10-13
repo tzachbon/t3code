@@ -2926,10 +2926,18 @@ const layerWsRpc = (
               (unsubscribe) => Effect.sync(unsubscribe),
             ),
           ),
-        [WS_METHODS.previewOpen]: (input) => previewManager.open(input),
+        [WS_METHODS.previewOpen]: (input) =>
+          previewManager.open(
+            serverBrowser.remoteEnabled
+              ? { ...input, runtime: "server", executionLocation: "depot" }
+              : input,
+          ),
         [WS_METHODS.previewNavigate]: (input) => previewManager.navigate(input),
         [WS_METHODS.previewResize]: (input) => previewManager.resize(input),
-        [WS_METHODS.previewAdjust]: (input) => previewManager.adjust(input),
+        [WS_METHODS.previewAdjust]: (input) =>
+          input.workspaceAction
+            ? serverBrowser.adjustWorkspace(input)
+            : previewManager.adjust(input),
         [WS_METHODS.previewRefresh]: (input) => previewManager.refresh(input),
         [WS_METHODS.previewClose]: (input) => previewManager.close(input),
         [WS_METHODS.previewList]: (input) => previewManager.list(input),

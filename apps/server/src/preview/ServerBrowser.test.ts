@@ -9,6 +9,7 @@ import {
   ThreadId,
   type PreviewAutomationSnapshot,
   type PreviewAutomationStatus,
+  type PreviewWorkspaceStatus,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
@@ -25,9 +26,11 @@ import { beforeEach, expect, vi } from "vite-plus/test";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as Broker from "../mcp/PreviewAutomationBroker.ts";
+import * as Workspaces from "../sandbox/Workspaces.ts";
 import * as DesktopChannel from "./DesktopBrowserChannel.ts";
 import * as Manager from "./Manager.ts";
 import * as ServerBrowser from "./ServerBrowser.ts";
+import * as RemoteBrowser from "./RemoteBrowser.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
 
 // Keep the manager, broker, ownership, refs, and viewer paths real; replace Chromium I/O only.
@@ -128,6 +131,8 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
   const context = {
     page,
     sessions,
+    connected: true,
+    browser: () => ({ isConnected: () => context.connected }),
     newPage: async () => page as unknown as Page,
     grantPermissions: vi.fn(async () => {}),
     exposeBinding: vi.fn(async (_name: string, binding: ClipboardBinding) => {
@@ -188,7 +193,83 @@ const asSession = (providerSessionId: string) => ({
   ...scope,
   thread: { ...testThread, providerSessionId },
 });
+let remoteEnabled = false;
+let remoteFailure = false;
+const remoteContexts = new Map<string, ReturnType<typeof makeContext>>();
+let remoteStops = 0;
+let remoteScratchPages = 0;
+const workspaceStatus = (): PreviewWorkspaceStatus => ({
+  state: "running",
+  generation: 1,
+  expiresAt: 9_000_000_000_000,
+  idleExpiresAt: 9_000_000_000_000,
+  absoluteExpiresAt: 9_000_000_000_000,
+  accruedMicroUsd: 0,
+  reservedMicroUsd: 180_000,
+  remainingMicroUsd: 99_820_000,
+  reason: null,
+});
+let remoteStatus = workspaceStatus();
+const remoteLease = (_threadId: string, generation?: number) =>
+  Effect.suspend(() =>
+    remoteEnabled &&
+    remoteStatus.state === "running" &&
+    (generation === undefined || generation === remoteStatus.generation)
+      ? Effect.void
+      : Effect.fail(new Workspaces.WorkspaceError({ reason: "not-running" })),
+  );
 const dependencies = Layer.mergeAll(
+  Layer.succeed(RemoteBrowser.RemoteBrowser, {
+    get enabled() {
+      return remoteEnabled;
+    },
+    page: (threadId, tabId) =>
+      Effect.sync(() => {
+        if (remoteFailure || !remoteEnabled) throw new Error("Remote transport unavailable");
+        const key = `${threadId}:${tabId}`;
+        const cached = remoteContexts.get(key);
+        const context = cached ?? makeContext();
+        remoteContexts.set(key, context);
+        return {
+          page: context.page as unknown as Page,
+          generation: remoteStatus.generation,
+          reused: cached !== undefined,
+        };
+      }),
+    scratchPage: () =>
+      Effect.sync(() => {
+        remoteScratchPages += 1;
+        return makeContext().page as unknown as Page;
+      }),
+    readFiles: (_threadId, _generation, paths) =>
+      Effect.succeed(
+        paths.map((path) => ({
+          name: path.split("/").at(-1)!,
+          mimeType: "application/octet-stream",
+          buffer: Buffer.from("remote binary"),
+        })),
+      ),
+    receiveDownload: () => Effect.succeed(Buffer.from("remote download")),
+    status: () => Effect.succeed(remoteStatus),
+    assertRunning: remoteLease,
+    touch: remoteLease,
+    stop: () =>
+      Effect.sync(() => {
+        remoteStops += 1;
+        remoteStatus = { ...remoteStatus, state: "stopped" };
+        return remoteStatus;
+      }),
+    recreate: () =>
+      Effect.sync(() => {
+        remoteContexts.clear();
+        remoteStatus = {
+          ...remoteStatus,
+          generation: remoteStatus.generation + 1,
+          state: "running",
+        };
+        return remoteStatus;
+      }),
+  }),
   Broker.layer,
   Manager.layer,
   Layer.succeed(ServerEnvironment.ServerEnvironment, {
@@ -268,6 +349,12 @@ const viewerInput = (tabId: string, canOperate: boolean) => ({
 });
 
 beforeEach(() => {
+  remoteEnabled = false;
+  remoteFailure = false;
+  remoteContexts.clear();
+  remoteStops = 0;
+  remoteScratchPages = 0;
+  remoteStatus = workspaceStatus();
   contexts.length = 0;
   contextRequests.length = 0;
   contextGate = null;
@@ -1567,4 +1654,292 @@ it.live("a desktop page that comes back reconnects without waiting for a viewer"
       expect(desktopConnections).toHaveLength(2);
     }),
   ).pipe(Effect.provide(layer)),
+);
+
+it.live("Depot agent tabs bypass an attached desktop and retain human ownership checks", () => {
+  remoteEnabled = true;
+  desktopRendersNext = true;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, broker, tabId } = yield* ready;
+      expect(contextRequests).toEqual([]);
+      expect(desktopConnections).toEqual([]);
+      expect(remoteContexts.size).toBe(1);
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      yield* viewer.input({ type: "takeControl" });
+      const denied = yield* broker
+        .invoke<void>({
+          scope,
+          tabId,
+          operation: "navigate",
+          input: { url: "https://example.com" },
+        })
+        .pipe(Effect.flip);
+      expect(denied).toMatchObject({ _tag: "PreviewAutomationControlInterruptedError" });
+      expect([...remoteContexts.values()][0]!.page.goto).not.toHaveBeenCalled();
+    }),
+  ).pipe(Effect.provide(layer));
+});
+
+it.live(
+  "workspace controls validate the tab's conversation and stopping keeps metadata for recreation",
+  () => {
+    remoteEnabled = true;
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const { browser, tabId } = yield* ready;
+        const manager = yield* Manager.PreviewManager;
+        const denied = yield* browser
+          .adjustWorkspace({
+            threadId: ThreadId.make("foreign-thread"),
+            tabId,
+            workspaceAction: "stop",
+          })
+          .pipe(Effect.flip);
+        expect(denied._tag).toBe("PreviewSessionLookupError");
+        expect(remoteStops).toBe(0);
+        yield* browser.adjustWorkspace({
+          threadId: testThread.threadId,
+          tabId,
+          workspaceAction: "stop",
+        });
+        const listed = yield* manager.list({ threadId: testThread.threadId });
+        expect(listed.sessions.find((tab) => tab.tabId === tabId)?.workspace?.state).toBe(
+          "stopped",
+        );
+        expect([...remoteContexts.values()][0]!.page.close).not.toHaveBeenCalled();
+        expect(
+          (yield* browser
+            .adjustWorkspace({ threadId: testThread.threadId, tabId, workspaceAction: "recreate" })
+            .pipe(Effect.flip))._tag,
+        ).toBe("PreviewWorkspaceError");
+      }),
+    ).pipe(Effect.provide(layer));
+  },
+);
+
+it.live("workspace shutdown preserves remote sessions even before CDP disconnects", () => {
+  remoteEnabled = true;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      // MCP workspace_stop persists stop-pending before killing Chrome, without browser.adjustWorkspace.
+      remoteStatus = { ...remoteStatus, state: "stop-pending" };
+      yield* Effect.promise(() => [...remoteContexts.values()][0]!.page.close());
+      yield* Effect.yieldNow;
+      yield* browser.adjustWorkspace({
+        threadId: testThread.threadId,
+        tabId,
+        workspaceAction: "status",
+      });
+      const listed = yield* manager.list({ threadId: testThread.threadId });
+      expect(listed.sessions.find((tab) => tab.tabId === tabId)?.workspace?.state).toBe(
+        "stop-pending",
+      );
+    }),
+  ).pipe(Effect.provide(layer));
+});
+
+it.live(
+  "status lists retained remote tabs after disconnect without reconnecting or allocating",
+  () => {
+    remoteEnabled = true;
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const { broker, tabId } = yield* ready;
+        const context = [...remoteContexts.values()][0]!;
+        context.connected = false;
+        yield* Effect.promise(() => context.page.close());
+        yield* Effect.yieldNow;
+        const status = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "status",
+          input: {},
+        });
+        expect(status.tabs).toEqual(
+          expect.arrayContaining([expect.objectContaining({ tabId, visible: false })]),
+        );
+        expect(remoteContexts.size).toBe(1);
+        expect(contextRequests).toEqual([]);
+      }),
+    ).pipe(Effect.provide(layer));
+  },
+);
+
+it.live("recreation navigates a fresh remote page to the retained successful URL", () => {
+  remoteEnabled = true;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      yield* manager.reportStatus({
+        threadId: testThread.threadId,
+        tabId,
+        serverControlled: true,
+        navStatus: { _tag: "Success", url: "https://example.com/retained", title: "Retained" },
+        canGoBack: false,
+        canGoForward: false,
+      });
+      yield* browser.adjustWorkspace({
+        threadId: testThread.threadId,
+        tabId,
+        workspaceAction: "stop",
+      });
+      yield* browser.adjustWorkspace({
+        threadId: testThread.threadId,
+        tabId,
+        workspaceAction: "recreate",
+        workspaceRequestId: "test-recreate",
+      });
+      yield* browser.attachViewer(viewerInput(tabId, true));
+      expect([...remoteContexts.values()][0]!.page.goto).toHaveBeenCalledWith(
+        "https://example.com/retained",
+        expect.anything(),
+      );
+    }),
+  ).pipe(Effect.provide(layer));
+});
+
+it.live("closing a remote page while its workspace runs removes its session", () => {
+  remoteEnabled = true;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      yield* Effect.promise(() => [...remoteContexts.values()][0]!.page.close());
+      let listed = yield* manager.list({ threadId: testThread.threadId });
+      while (listed.sessions.length) {
+        yield* Effect.yieldNow;
+        listed = yield* manager.list({ threadId: testThread.threadId });
+      }
+      expect(listed.sessions).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layer));
+});
+
+it.live(
+  "a retained Depot marker cannot fall back locally after remote workspaces are disabled",
+  () => {
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const browser = yield* ServerBrowser.ServerBrowser;
+        const manager = yield* Manager.PreviewManager;
+        const snapshot = yield* manager.open({
+          threadId: testThread.threadId,
+          runtime: "server",
+          executionLocation: "depot",
+          reveal: false,
+        });
+        expect(
+          (yield* browser.attachViewer(viewerInput(snapshot.tabId, true)).pipe(Effect.flip))._tag,
+        ).toBe("ServerBrowserLaunchError");
+        expect(remoteContexts.size).toBe(0);
+        expect(contextRequests).toEqual([]);
+        expect(desktopConnections).toEqual([]);
+      }),
+    ).pipe(Effect.provide(layer));
+  },
+);
+
+it.live("default remote reads check the lease before reading a cached page", () => {
+  remoteEnabled = true;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const { broker } = yield* ready;
+      const page = [...remoteContexts.values()][0]!.page;
+      page.evaluate.mockClear();
+      page.ariaSnapshot.mockClear();
+      remoteStatus = { ...remoteStatus, state: "expired" };
+      const denied = yield* broker
+        .invoke<PreviewAutomationSnapshot>({
+          scope: asSession("later-session"),
+          operation: "snapshot",
+          input: {},
+        })
+        .pipe(Effect.flip);
+      expect(denied._tag).toBe("PreviewAutomationExecutionError");
+      expect(page.evaluate).not.toHaveBeenCalled();
+      expect(page.ariaSnapshot).not.toHaveBeenCalled();
+    }),
+  ).pipe(Effect.provide(layer));
+});
+
+it.live("human dialog replies check the remote lease before resolving the page dialog", () => {
+  remoteEnabled = true;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, tabId } = yield* ready;
+      const page = [...remoteContexts.values()][0]!.page;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      yield* viewer.input({ type: "takeControl" });
+      const dialog = {
+        type: () => "confirm",
+        message: () => "Continue?",
+        defaultValue: () => "",
+        accept: vi.fn(async () => {}),
+        dismiss: vi.fn(async () => {}),
+      };
+      page.emit("dialog", dialog);
+      remoteStatus = { ...remoteStatus, state: "expired" };
+      yield* viewer.input({ type: "dialog", accept: true });
+      expect(dialog.accept).not.toHaveBeenCalled();
+    }),
+  ).pipe(Effect.provide(layer));
+});
+
+it.live("a failed Depot connection cannot fall back to the local browser or desktop", () => {
+  remoteEnabled = true;
+  remoteFailure = true;
+  desktopRendersNext = true;
+  return Effect.scoped(
+    Effect.gen(function* () {
+      yield* ServerBrowser.ServerBrowser;
+      const broker = yield* Broker.PreviewAutomationBroker;
+      yield* Effect.yieldNow;
+      yield* broker
+        .invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { reuseExistingTab: false, show: false },
+        })
+        .pipe(Effect.flip);
+      expect(contextRequests).toEqual([]);
+      expect(desktopConnections).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layer));
+});
+
+it.live(
+  "remote file inputs receive bytes instead of environment paths and recording creates its encoder remotely",
+  () => {
+    remoteEnabled = true;
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const { broker, tabId } = yield* ready;
+        const context = [...remoteContexts.values()][0]!;
+        const setInputFiles = vi.fn(async () => {});
+        context.page.locator.mockImplementation(() => ({ setInputFiles }) as never);
+        yield* broker.invoke({
+          scope,
+          tabId,
+          operation: "upload",
+          input: { paths: ["/workspace/report.csv"], selector: "input[type=file]" },
+        });
+        expect(setInputFiles).toHaveBeenCalledWith(
+          [
+            {
+              name: "report.csv",
+              mimeType: "application/octet-stream",
+              buffer: Buffer.from("remote binary"),
+            },
+          ],
+          { timeout: 15000 },
+        );
+        yield* broker.invoke({ scope, tabId, operation: "recordingStart", input: {} });
+        expect(remoteScratchPages).toBe(1);
+        expect(contextRequests).toEqual([]);
+      }),
+    ).pipe(Effect.provide(layer));
+  },
 );

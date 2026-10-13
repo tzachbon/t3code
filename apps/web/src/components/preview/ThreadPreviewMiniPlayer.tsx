@@ -135,6 +135,14 @@ function BrowserMiniPlayer({ threadRef, tabId, miniPlayer }: Props & { readonly 
   const serverSurfaceRef = useRef<ServerBrowserHandle | null>(null);
   const serverPictureInPicture =
     useServerPictureInPictureKey() === serverPictureInPictureKey(threadRef.threadId, tabId);
+  const workspaceUnavailable =
+    snapshot?.executionLocation === "depot" &&
+    (snapshot.workspace?.state === "stopped" ||
+      snapshot.workspace?.state === "expired" ||
+      snapshot.workspace?.state === "stop-pending");
+  useEffect(() => {
+    if (workspaceUnavailable && serverPictureInPicture) closeServerPictureInPicture();
+  }, [workspaceUnavailable, serverPictureInPicture]);
   const sourceSize =
     serverTab && streamViewport
       ? streamViewport
@@ -174,7 +182,7 @@ function BrowserMiniPlayer({ threadRef, tabId, miniPlayer }: Props & { readonly 
     }
   };
 
-  if (!snapshot) return null;
+  if (!snapshot || workspaceUnavailable) return null;
   const poppedOut = serverTab ? serverPictureInPicture : Boolean(desktopOverlay?.pictureInPicture);
   const canPopOut = serverTab ? supportsServerPictureInPicture() : true;
 

@@ -36,9 +36,15 @@ export function alternatePreviewRuntime(
   environmentId: EnvironmentId,
   primaryEnvironmentId: EnvironmentId | null,
   serverBrowser: boolean,
-  snapshot: Pick<PreviewSessionSnapshot, "runtime"> | null | undefined,
+  snapshot: Pick<PreviewSessionSnapshot, "runtime" | "executionLocation"> | null | undefined,
 ): PreviewRuntime | null {
-  if (!snapshot || !serverBrowser || !isPreviewSupportedInRuntime()) return null;
+  if (
+    !snapshot ||
+    snapshot.executionLocation === "depot" ||
+    !serverBrowser ||
+    !isPreviewSupportedInRuntime()
+  )
+    return null;
   if (environmentId === primaryEnvironmentId) return null;
   return snapshot.runtime === "server" ? "desktop" : "server";
 }
@@ -61,11 +67,12 @@ export function usePreviewAvailable(environmentId: EnvironmentId | null): boolea
 export function rendersServerTabNatively(
   environmentId: EnvironmentId,
   primaryEnvironmentId: EnvironmentId | null,
-  snapshot: Pick<PreviewSessionSnapshot, "runtime"> | null | undefined,
+  snapshot: Pick<PreviewSessionSnapshot, "runtime" | "executionLocation"> | null | undefined,
 ): boolean {
   return (
     isElectron &&
     snapshot?.runtime === "server" &&
+    snapshot.executionLocation !== "depot" &&
     primaryEnvironmentId !== null &&
     environmentId === primaryEnvironmentId
   );
@@ -73,7 +80,7 @@ export function rendersServerTabNatively(
 
 export function useRendersServerTabNatively(
   environmentId: EnvironmentId,
-  snapshot: Pick<PreviewSessionSnapshot, "runtime"> | null | undefined,
+  snapshot: Pick<PreviewSessionSnapshot, "runtime" | "executionLocation"> | null | undefined,
 ): boolean {
   return rendersServerTabNatively(environmentId, useAtomValue(primaryEnvironmentIdAtom), snapshot);
 }

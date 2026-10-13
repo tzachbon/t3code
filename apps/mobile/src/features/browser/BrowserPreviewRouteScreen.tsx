@@ -1,11 +1,6 @@
 import { useIsFocused, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
-import {
-  EnvironmentId,
-  FILL_PREVIEW_VIEWPORT,
-  ThreadId,
-  type PreviewSessionSnapshot,
-} from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, type PreviewSessionSnapshot } from "@t3tools/contracts";
 import { normalizePreviewUrl } from "@t3tools/shared/preview";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, AppState, Platform, TextInput, View } from "react-native";
@@ -16,6 +11,7 @@ import { ScreenHeader } from "../../components/ScreenHeader";
 import { NativeHeaderToolbar } from "../../native/StackHeader";
 import { useThreadServerBrowserTabs } from "../../state/preview";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
+import { BrowserWorkspaceControls } from "./BrowserWorkspaceControls";
 import { BrowserTabMenu } from "./BrowserTabMenu";
 import { browserTabTitle, browserTabUrl, latestBrowserTab } from "./browserTabs";
 import {
@@ -176,7 +172,13 @@ function BrowserPreviewScreen({
             ready={streaming && canControl}
             onCommand={(input) => streamRef.current?.command(input)}
           />
-          {live ? (
+          {tab.executionLocation === "depot" ? (
+            <BrowserWorkspaceControls environmentId={environmentId} tab={tab} visible={live} />
+          ) : null}
+          {live &&
+          tab.workspace?.state !== "stopped" &&
+          tab.workspace?.state !== "expired" &&
+          tab.workspace?.state !== "stop-pending" ? (
             <PreviewStreamWebView
               key={`stream:${tab.tabId}`}
               environmentId={environmentId}

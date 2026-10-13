@@ -1,7 +1,7 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { type PreviewEvent, ThreadId } from "@t3tools/contracts";
+import { type PreviewEvent, type PreviewWorkspaceStatus, ThreadId } from "@t3tools/contracts";
 import { PreviewUrlNormalizationError } from "@t3tools/shared/preview";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -128,6 +128,43 @@ it.layer(layer)("PreviewManager", (it) => {
         snapshot: { colorScheme: "dark", zoomFactor: 1.25 },
       });
       expect(events.at(-2)).not.toHaveProperty("request");
+    }),
+  );
+
+  it.effect("ignores stale workspace polls across stop and recreation", () =>
+    Effect.gen(function* () {
+      const threadId = freshThreadId();
+      const manager = yield* PreviewManager.PreviewManager;
+      const opened = yield* manager.open({
+        threadId,
+        runtime: "server",
+        executionLocation: "depot",
+      });
+      const stopped: PreviewWorkspaceStatus = {
+        state: "stopped",
+        generation: 2,
+        expiresAt: 100,
+        idleExpiresAt: 100,
+        absoluteExpiresAt: 100,
+        accruedMicroUsd: 10,
+        reservedMicroUsd: 0,
+        remainingMicroUsd: 90,
+        reason: "user",
+      };
+      yield* manager.adjust({ threadId, tabId: opened.tabId, workspace: stopped });
+      for (const stale of [
+        { ...stopped, generation: 1, state: "running" as const },
+        { ...stopped, state: "running" as const },
+        { ...stopped, state: "stop-pending" as const },
+        { ...stopped, state: "creating" as const },
+      ]) {
+        const updated = yield* manager.adjust({ threadId, tabId: opened.tabId, workspace: stale });
+        expect(updated.workspace).toEqual(stopped);
+      }
+      const recreated = { ...stopped, generation: 3, state: "running" as const, reason: null };
+      expect(
+        (yield* manager.adjust({ threadId, tabId: opened.tabId, workspace: recreated })).workspace,
+      ).toEqual(recreated);
     }),
   );
 

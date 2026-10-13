@@ -71,6 +71,11 @@ import * as ServerBrowser from "./preview/ServerBrowser.ts";
 import * as DesktopBrowserChannel from "./preview/DesktopBrowserChannel.ts";
 import * as ServerBrowserStream from "./preview/ServerBrowserStream.ts";
 import * as PreviewBrowser from "./preview/PreviewBrowser.ts";
+import * as DepotWorkspaces from "./sandbox/Workspaces.ts";
+import * as ApiBrowserChannel from "./sandbox/ApiBrowserChannel.ts";
+import * as RemoteBrowser from "./preview/RemoteBrowser.ts";
+import * as WorkspaceExecution from "./sandbox/Execution.ts";
+import * as SourceSnapshot from "./sandbox/SourceSnapshot.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
@@ -304,6 +309,11 @@ const layerHttpServer = Layer.unwrap(
 const layerPlatformServices = NodeServices.layer;
 
 const layerPersistence = Layer.empty.pipe(Layer.provideMerge(SqlitePersistence.layerConfig));
+
+const layerRemoteWorkspaces = DepotWorkspaces.layer.pipe(
+  Layer.provideMerge(DepotWorkspaces.layerDepot),
+  Layer.provide(layerPersistence),
+);
 
 const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer));
 
@@ -734,6 +744,14 @@ const layerMakeRoutes = Layer.mergeAll(
   Layer.provide(layerPullRequestService),
   // The stream route and the WebSocket RPCs share one browser.
   Layer.provide(ServerBrowser.layer.pipe(Layer.provide(DesktopBrowserChannel.layer))),
+  Layer.provide(RemoteBrowser.layer),
+  Layer.provide(
+    WorkspaceExecution.layer.pipe(
+      Layer.provide(SourceSnapshot.layer),
+    ),
+  ),
+  Layer.provide(ApiBrowserChannel.layer),
+  Layer.provide(layerRemoteWorkspaces),
   // Server browser tabs and HTML render previews install and run the same headless browser.
   Layer.provide(PreviewBrowser.layer),
   Layer.provide(PreviewAutomationBroker.layer),

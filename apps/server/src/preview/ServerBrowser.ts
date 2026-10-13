@@ -10,6 +10,10 @@ import {
   resolveBrowserProfiles,
   type BrowserProfile,
   type PreviewReportProfilesInput,
+  type PreviewAdjustInput,
+  type PreviewError,
+  PreviewSessionLookupError,
+  PreviewWorkspaceError,
   PREVIEW_AUTOMATION_SERVER_OPERATIONS,
   PreviewViewportSetting as PreviewViewportSettingSchema,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
@@ -208,9 +212,16 @@ export interface ServerBrowserViewer {
   readonly input: (message: unknown) => Effect.Effect<void>;
 }
 
+import * as RemoteBrowser from "./RemoteBrowser.ts";
+import * as Workspaces from "../sandbox/Workspaces.ts";
+
 export class ServerBrowser extends Context.Service<
   ServerBrowser,
   {
+    readonly remoteEnabled: boolean;
+    readonly adjustWorkspace: (
+      input: PreviewAdjustInput,
+    ) => Effect.Effect<PreviewSessionSnapshot, PreviewError>;
     readonly attachViewer: (input: {
       readonly threadId: string;
       readonly tabId: string;
@@ -300,6 +311,8 @@ interface ServerTab {
   readonly control: SessionControl;
   /** The tab's own storage context, closed with it. Popups share their opener's. */
   readonly isolatedContext: boolean;
+  readonly remote: boolean;
+  readonly remoteGeneration: number | undefined;
   /**
    * Set when the desktop app renders this tab. The server drives the desktop's
    * page; the desktop owns its size, storage, and window.
@@ -482,6 +495,7 @@ const make = Effect.gen(function* () {
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const previewBrowser = yield* PreviewBrowser.PreviewBrowser;
   const desktopChannel = yield* DesktopBrowserChannel.DesktopBrowserChannel;
+  const remoteBrowser = yield* RemoteBrowser.RemoteBrowser;
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const launchServices = yield* Effect.context<ChildProcessSpawner.ChildProcessSpawner>();
   // The fix every host error names, rendered for how this server was launched.
@@ -690,12 +704,13 @@ const make = Effect.gen(function* () {
     tab.closing = true;
     clearAbortedNavigation(tab);
     // A desktop page outlives the connection unless its session closed with it.
-    const end = tab.desktop && !closeSession && sessionOpen(tab) ? "reconnect" : "gone";
+    const preservePage = (tab.desktop !== null || tab.remote) && !closeSession && sessionOpen(tab);
+    const end = preservePage ? "reconnect" : "gone";
     for (const viewer of tab.viewers) viewer.push({ _tag: end });
     void tab.control.close().catch(constVoid);
     // The desktop owns its page; letting go only ends this connection.
     if (tab.desktop) void tab.desktop.close().catch(constVoid);
-    else void tab.page.close().catch(constVoid);
+    else if (!preservePage) void tab.page.close().catch(constVoid);
     if (tab.isolatedContext) void tab.page.context().close().catch(constVoid);
     void tab.recording?.encoder.close().catch(constVoid);
     void NodeFSP.rm(downloadDir(tab), { recursive: true, force: true }).catch(constVoid);
@@ -745,17 +760,25 @@ const make = Effect.gen(function* () {
   const createTab = async (snapshot: PreviewSessionSnapshot): Promise<ServerTab> => {
     const adopted = adoptedPages.get(tabKey(snapshot.threadId, snapshot.tabId));
     adoptedPages.delete(tabKey(snapshot.threadId, snapshot.tabId));
+    const remote = snapshot.executionLocation === "depot";
+    const remotePage = remote
+      ? await Effect.runPromise(
+          remoteBrowser.page(snapshot.threadId, snapshot.tabId, adopted?.page),
+        )
+      : null;
     const desktop =
-      adopted === undefined && (await desktopRenders(snapshot))
+      !remote && adopted === undefined && (await desktopRenders(snapshot))
         ? await connectDesktop(snapshot)
         : null;
     // An agent tab without a profile (no client reported one) keeps throwaway storage.
     const isolatedContext =
       adopted === undefined &&
       desktop === null &&
+      !remote &&
       ((snapshot.automationOwner !== undefined && snapshot.profileId === undefined) ||
         snapshot.profileId === INCOGNITO_BROWSER_PROFILE_ID);
     const context =
+      remotePage?.page.context() ??
       adopted?.page.context() ??
       desktop?.page.context() ??
       (await contexts.contextFor(
@@ -765,7 +788,7 @@ const make = Effect.gen(function* () {
     if (adopted?.page.isClosed()) throw new Error("The popup closed before it opened.");
     // The desktop page already has its own clipboard; the bridge script is for headless tabs.
     if (!desktop) await prepareContext(context);
-    const page = adopted?.page ?? desktop?.page ?? (await context.newPage());
+    const page = remotePage?.page ?? adopted?.page ?? desktop?.page ?? (await context.newPage());
     const cdp = await context.newCDPSession(page);
     // The desktop's page is already a normal browser. A popup's first request
     // went out before it became a tab; everything after presents as Chrome.
@@ -788,6 +811,8 @@ const make = Effect.gen(function* () {
       actionTimeline: [],
       control,
       isolatedContext,
+      remote,
+      remoteGeneration: remotePage?.generation,
       desktop: desktop === null ? null : { close: desktop.close },
       profileId: snapshot.profileId,
       openerTabId: adopted?.openerTabId,
@@ -904,18 +929,40 @@ const make = Effect.gen(function* () {
       if (isolatedContext) await context.close().catch(constVoid);
       throw new ServerBrowserTabNotFoundError({ threadId: tab.threadId, tabId: tab.tabId });
     }
-    page.on("close", () => dropTab(tab, true));
+    page.on("close", () => {
+      if (!tab.remote) {
+        dropTab(tab, true);
+        return;
+      }
+      // A workspace kill can destroy targets before CDP disconnects; retain its tab for Recreate.
+      void Effect.runPromise(remoteBrowser.status(tab.threadId)).then(
+        (workspace) =>
+          dropTab(
+            tab,
+            workspace?.state === "running" &&
+              workspace.generation === tab.remoteGeneration &&
+              (page.context().browser()?.isConnected() ?? false),
+          ),
+        () => dropTab(tab, false),
+      );
+    });
     page.on("crash", () => dropTab(tab, true));
     tabs.set(key, tab);
     reportLiveTabs();
     // A popup is already loading its own URL, and the desktop loads its tab's.
-    if (!adopted && !desktop && snapshot.navStatus._tag === "Loading") {
+    if (
+      !adopted &&
+      !desktop &&
+      !remotePage?.reused &&
+      (snapshot.navStatus._tag === "Loading" || (remote && snapshot.navStatus._tag !== "Idle"))
+    ) {
       tab.initialNavigation = page
         .goto(snapshot.navStatus.url, { waitUntil: "commit", timeout: NAVIGATION_TIMEOUT_MS })
         .then(constVoid);
       // Background creation keeps the failed tab; automation awaits the original error.
       void tab.initialNavigation.catch(constVoid);
     }
+    if (remote) await Effect.runPromise(publishWorkspace(tab.threadId));
     return tab;
   };
 
@@ -968,9 +1015,20 @@ const make = Effect.gen(function* () {
     if (navigation !== null) clearAbortedNavigation(tab);
     let offered: { readonly id: string; readonly fileName: string } | undefined;
     try {
-      if (await download.failure()) return;
+      if (!tab.remote && (await download.failure())) return;
+      const remoteBytes = tab.remote
+        ? await Effect.runPromise(
+            remoteBrowser.receiveDownload(
+              tab.threadId,
+              tab.remoteGeneration!,
+              tab.page,
+              download.url(),
+            ),
+          )
+        : null;
       await NodeFSP.mkdir(downloadDir(tab), { recursive: true });
-      await download.saveAs(path);
+      if (remoteBytes !== null) await NodeFSP.writeFile(path, remoteBytes);
+      else await download.saveAs(path);
       const { size } = await NodeFSP.stat(path);
       if (tab.closing || size > DOWNLOAD_MAX_BYTES) {
         await NodeFSP.rm(path, { force: true });
@@ -1075,6 +1133,24 @@ const make = Effect.gen(function* () {
       open.offeredTo !== tab.control.controller
     )
       return false;
+    if (tab.remote) {
+      const size = input.files.reduce((total, file) => total + file.buffer.byteLength, 0);
+      if (
+        input.files.length > 20 ||
+        size > PROVIDER_SEND_TURN_MAX_FILE_BYTES ||
+        input.files.some(
+          (file) =>
+            !file.name ||
+            file.name.length > 255 ||
+            file.name === "." ||
+            file.name === ".." ||
+            // eslint-disable-next-line no-control-regex -- Uploaded names must be single safe path components.
+            /[\\/\x00-\x1f\x7f]/.test(file.name),
+        )
+      )
+        return false;
+      await Effect.runPromise(remoteBrowser.touch(tab.threadId, tab.remoteGeneration));
+    }
     if (input.files.length > 0) {
       await open.chooser.setFiles(
         open.chooser.isMultiple() ? [...input.files] : input.files.slice(0, 1),
@@ -1091,7 +1167,14 @@ const make = Effect.gen(function* () {
         "PreviewAutomationExecutionError",
         `Upload paths must be absolute: ${relative}`,
       );
-    if (await ServerBrowserPage.setInputFiles(tab.page, input)) return undefined;
+    const files = tab.remote
+      ? [
+          ...(await Effect.runPromise(
+            remoteBrowser.readFiles(tab.threadId, tab.remoteGeneration!, input.paths),
+          )),
+        ]
+      : [...input.paths];
+    if (await ServerBrowserPage.setInputFiles(tab.page, input, files)) return undefined;
     const open = tab.fileChooser;
     if (!open)
       throw new ServerBrowserPage.ServerBrowserOperationError(
@@ -1104,7 +1187,7 @@ const make = Effect.gen(function* () {
         "This file picker accepts one file.",
       );
     if (input.paths.length > 0)
-      await open.chooser.setFiles([...input.paths], {
+      await open.chooser.setFiles(files, {
         timeout: input.timeoutMs ?? NAVIGATION_TIMEOUT_MS,
       });
     if (tab.fileChooser === open) closeFileChooser(tab);
@@ -1158,6 +1241,7 @@ const make = Effect.gen(function* () {
         threadId: opener.threadId,
         ...(/^https?:/i.test(url) ? { url } : {}),
         runtime: "server",
+        ...(opener.remote ? { executionLocation: "depot" as const } : {}),
         ...(opener.profileId === undefined ? {} : { profileId: opener.profileId }),
         // Agent popups stay with the agent and only float when it asks, like its own opens.
         ...(opener.control.agentId === null
@@ -1208,7 +1292,13 @@ const make = Effect.gen(function* () {
   const findTab = (threadId: string, tabId: string) =>
     Effect.gen(function* () {
       const existing = tabs.get(tabKey(threadId, tabId));
-      if (existing) return existing;
+      if (existing) {
+        if (existing.remote)
+          yield* remoteBrowser
+            .assertRunning(threadId, existing.remoteGeneration)
+            .pipe(Effect.mapError((cause) => new ServerBrowserLaunchError({ cause })));
+        return existing;
+      }
       const { sessions } = yield* manager.list({ threadId: ThreadId.make(threadId) });
       const snapshot = sessions.find(
         (session) => session.tabId === tabId && session.runtime === "server",
@@ -1237,7 +1327,12 @@ const make = Effect.gen(function* () {
   const closeIdleAgentTabs = () => {
     const cutoff = Date.now() - AGENT_TAB_IDLE_MS;
     for (const tab of tabs.values()) {
-      if (tab.control.agentId !== null && tab.viewers.size === 0 && tab.usedAt < cutoff)
+      if (
+        !tab.remote &&
+        tab.control.agentId !== null &&
+        tab.viewers.size === 0 &&
+        tab.usedAt < cutoff
+      )
         dropTab(tab, true);
     }
   };
@@ -1336,6 +1431,9 @@ const make = Effect.gen(function* () {
       url: url === "about:blank" ? null : url,
       title: null,
       loading: tab.loading,
+      ...(tab.remote
+        ? { workspace: await Effect.runPromise(remoteBrowser.status(tab.threadId)) }
+        : {}),
       control: {
         owner: tabOwner(tab),
         ownedByCaller: tab.control.agentId === agentSessionId,
@@ -1429,7 +1527,11 @@ const make = Effect.gen(function* () {
   const startRecording = (tab: ServerTab): Promise<Recording> => {
     const started = withCaptureLock(tab, async () => {
       if (tab.recording) return tab.recording;
-      const encoder = await contexts.scratchPage();
+      const encoder = tab.remote
+        ? await Effect.runPromise(
+            remoteBrowser.scratchPage(tab.threadId, tab.tabId, tab.remoteGeneration!),
+          )
+        : await contexts.scratchPage();
       let session: CDPSession | null = null;
       try {
         await encoder.evaluate(ServerBrowserPage.RECORDING_ENCODER_SCRIPT);
@@ -1540,12 +1642,25 @@ const make = Effect.gen(function* () {
             "The recording is larger than the attachment limit.",
           );
         }
+        if (!Number.isSafeInteger(stopped.count) || stopped.count < 0 || stopped.count > 4096)
+          throw new ServerBrowserPage.ServerBrowserOperationError(
+            "PreviewAutomationRecordingTooLargeError",
+            "The recording has too many chunks.",
+          );
+        let receivedBytes = 0;
         for (let index = 0; index < stopped.count; index += 1) {
           const chunk = await recording.encoder.evaluate(
             (chunkIndex) => (globalThis as unknown as EncoderWindow).__t3Recorder.chunk(chunkIndex),
             index,
           );
-          chunks.push(Buffer.from(chunk, "base64"));
+          const bytes = Buffer.from(chunk, "base64");
+          receivedBytes += bytes.byteLength;
+          if (receivedBytes > PROVIDER_SEND_TURN_MAX_FILE_BYTES)
+            throw new ServerBrowserPage.ServerBrowserOperationError(
+              "PreviewAutomationRecordingTooLargeError",
+              "The recording is larger than the attachment limit.",
+            );
+          chunks.push(bytes);
         }
       } finally {
         await recording.encoder.close().catch(constVoid);
@@ -1660,6 +1775,8 @@ const make = Effect.gen(function* () {
         "No server preview tab is open for this thread. Call preview_open first.",
       );
     }
+    if (tab.remote)
+      await Effect.runPromise(remoteBrowser.assertRunning(tab.threadId, tab.remoteGeneration));
     // Any tab in the thread can be read; acting is checked by its control.
     if (!READ_OPERATIONS.has(request.operation) && !tab.control.agentMayAct(request.agentSessionId))
       throw new BrowserControlInterrupted(
@@ -1687,13 +1804,40 @@ const make = Effect.gen(function* () {
   const runOperation = async (request: PreviewAutomationRequest): Promise<unknown> => {
     const input = request.input;
     switch (request.operation) {
-      case "status":
-        return statusWithTitle(
+      case "status": {
+        const status = await statusWithTitle(
           request.tabId === undefined
             ? latestThreadTab(request.threadId, request.agentSessionId)
             : tabs.get(tabKey(request.threadId, request.tabId)),
           request.agentSessionId,
         );
+        const workspace = remoteBrowser.enabled
+          ? await Effect.runPromise(remoteBrowser.status(request.threadId))
+          : undefined;
+        const retained = remoteBrowser.enabled
+          ? (await Effect.runPromise(manager.list({ threadId: request.threadId }))).sessions.filter(
+              (snapshot) =>
+                snapshot.executionLocation === "depot" &&
+                !tabs.has(tabKey(request.threadId, snapshot.tabId)),
+            )
+          : [];
+        return {
+          ...status,
+          ...(workspace ? { workspace } : {}),
+          ...(retained.length
+            ? {
+                tabs: [
+                  ...(status.tabs ?? []),
+                  ...retained.map((snapshot) => ({
+                    tabId: snapshot.tabId,
+                    url: snapshot.navStatus._tag === "Idle" ? null : snapshot.navStatus.url,
+                    visible: false,
+                  })),
+                ],
+              }
+            : {}),
+        };
+      }
       case "open": {
         if (!request.agentSessionId)
           throw new BrowserControlInterrupted(
@@ -1746,6 +1890,7 @@ const make = Effect.gen(function* () {
                 ...(url ? { url } : {}),
                 ...(profileId === undefined ? {} : { profileId }),
                 runtime: "server",
+                ...(remoteBrowser.enabled ? { executionLocation: "depot" as const } : {}),
                 reveal: false,
                 automationOwner: request.agentSessionId,
               }),
@@ -1757,6 +1902,8 @@ const make = Effect.gen(function* () {
             "dialogPending",
           );
         return tab.control.agent(request.agentSessionId, async () => {
+          if (tab.remote)
+            await Effect.runPromise(remoteBrowser.touch(tab.threadId, tab.remoteGeneration));
           if (tab.dialog)
             throw new BrowserControlInterrupted(
               "A browser dialog is pending. Read preview_status and use preview_dialog first.",
@@ -1816,7 +1963,11 @@ const make = Effect.gen(function* () {
             "No recording is active for this thread.",
           );
         }
-        return tab.control.agent(request.agentSessionId ?? "", () => stopRecording(tab));
+        return tab.control.agent(request.agentSessionId ?? "", async () => {
+          if (tab.remote)
+            await Effect.runPromise(remoteBrowser.touch(tab.threadId, tab.remoteGeneration));
+          return stopRecording(tab);
+        });
       }
     }
     const tab = await requireTab(request);
@@ -1839,6 +1990,8 @@ const make = Effect.gen(function* () {
     if (request.operation === "dialog") {
       if (tab.control.controller !== null)
         throw new BrowserControlInterrupted("A human controls this tab.", "humanControl");
+      if (tab.remote)
+        await Effect.runPromise(remoteBrowser.touch(tab.threadId, tab.remoteGeneration));
       await resolveDialog(tab, input as PreviewAutomationDialogInput);
       return statusWithTitle(tab, request.agentSessionId);
     }
@@ -1877,6 +2030,8 @@ const make = Effect.gen(function* () {
   };
 
   const executeTabOperation = async (tab: ServerTab, request: PreviewAutomationRequest) => {
+    if (tab.remote && !READ_OPERATIONS.has(request.operation))
+      await Effect.runPromise(remoteBrowser.touch(tab.threadId, tab.remoteGeneration));
     const input = request.input;
     switch (request.operation) {
       case "navigate": {
@@ -1968,7 +2123,13 @@ const make = Effect.gen(function* () {
 
   const handleRequest = (connectionId: string, request: PreviewAutomationRequest) =>
     Effect.tryPromise({
-      try: () => runOperation(request).finally(() => markUsed(request)),
+      try: async () => {
+        const result = await runOperation(request);
+        if (request.operation !== "status") {
+          markUsed(request);
+        }
+        return result;
+      },
       catch: ServerBrowserPage.toOperationError,
     }).pipe(
       Effect.match({
@@ -2013,6 +2174,10 @@ const make = Effect.gen(function* () {
       if (event.type === "resized") {
         await tab.control
           .system(async () => {
+            if (tab.remote)
+              await Effect.runPromise(
+                remoteBrowser.assertRunning(tab.threadId, tab.remoteGeneration),
+              );
             if (
               !viewportSettingsEqual(event.snapshot.viewport ?? FILL_PREVIEW_VIEWPORT, tab.setting)
             ) {
@@ -2059,6 +2224,8 @@ const make = Effect.gen(function* () {
     const message = asRecord(raw);
     if (!message) return;
     viewer.inputAt = Date.now();
+    if (tab.remote)
+      await Effect.runPromise(remoteBrowser.touch(tab.threadId, tab.remoteGeneration));
     const modifiers = modifiersOf(message);
     switch (message.type) {
       case "mouse": {
@@ -2365,6 +2532,8 @@ const make = Effect.gen(function* () {
                 tab.control.controller === viewer.id &&
                 typeof message.accept === "boolean"
               ) {
+                if (tab.remote)
+                  await Effect.runPromise(remoteBrowser.touch(tab.threadId, tab.remoteGeneration));
                 await resolveDialog(tab, {
                   accept: message.accept,
                   ...(typeof message.promptText === "string"
@@ -2387,6 +2556,7 @@ const make = Effect.gen(function* () {
   yield* manager.events.pipe(Stream.runForEach(mirrorManagerEvent), Effect.forkScoped);
   // Whoever runs the server learns the fix before anyone opens a tab.
   if (
+    !remoteBrowser.enabled &&
     !PreviewBrowserHost.sandboxDisabled(yield* HostProcess.Environment) &&
     (yield* PreviewBrowserHost.sandboxBlocked)
   ) {
@@ -2464,6 +2634,47 @@ const make = Effect.gen(function* () {
     }),
   );
 
+  const publishWorkspace = (threadId: string) =>
+    Effect.gen(function* () {
+      const workspace = yield* remoteBrowser.status(threadId);
+      const { sessions } = yield* manager.list({ threadId: ThreadId.make(threadId) });
+      for (const snapshot of sessions) {
+        if (snapshot.executionLocation === "depot" && workspace)
+          yield* manager.adjust({
+            threadId: ThreadId.make(threadId),
+            tabId: snapshot.tabId,
+            workspace,
+          });
+      }
+    });
+  const adjustWorkspace: ServerBrowser["Service"]["adjustWorkspace"] = (input) =>
+    Effect.gen(function* () {
+      const { sessions } = yield* manager.list({ threadId: input.threadId });
+      const snapshot = sessions.find((session) => session.tabId === input.tabId);
+      if (!snapshot || snapshot.executionLocation !== "depot")
+        return yield* new PreviewSessionLookupError({
+          threadId: input.threadId,
+          tabId: input.tabId,
+        });
+      if (input.workspaceAction === "stop") {
+        // Mark these as reconnectable before the vendor ends Chrome and emits page-close events.
+        for (const tab of tabs.values())
+          if (tab.remote && tab.threadId === input.threadId) dropTab(tab, false);
+        yield* remoteBrowser.stop(input.threadId);
+      } else if (input.workspaceAction === "recreate") {
+        if (!input.workspaceRequestId)
+          return yield* new Workspaces.WorkspaceError({ reason: "invalid-input" });
+        yield* remoteBrowser.recreate(input.threadId, input.workspaceRequestId);
+      }
+      yield* publishWorkspace(input.threadId);
+      const updated = yield* manager.list({ threadId: input.threadId });
+      return updated.sessions.find((session) => session.tabId === input.tabId)!;
+    }).pipe(
+      Effect.catchTags({
+        WorkspaceError: (error) => Effect.fail(new PreviewWorkspaceError({ reason: error.reason })),
+      }),
+    );
+
   const clearProfile = (profileId: string) =>
     Effect.tryPromise({
       try: () => contexts.clearProfile(profileId),
@@ -2471,6 +2682,8 @@ const make = Effect.gen(function* () {
     });
 
   return ServerBrowser.of({
+    remoteEnabled: remoteBrowser.enabled,
+    adjustWorkspace,
     attachViewer,
     clearProfile,
     reportProfiles,
