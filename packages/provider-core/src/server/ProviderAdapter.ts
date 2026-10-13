@@ -417,6 +417,8 @@ export interface ProviderAdapterV2TurnInput {
   readonly message: ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
+  /** Historical context kept separate from a native command's message text. */
+  readonly untrustedContext?: string;
   /**
    * What the thread's MCP Apps want the agent to know (`ui/update-model-context`),
    * latest per app, keyed stably per app. Adapters that host apps deliver it as
@@ -595,7 +597,7 @@ export interface ProviderAdapterV2SessionRuntime {
   ) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   readonly startTurn: (
     input: ProviderAdapterV2TurnInput,
-  ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  ) => Effect.Effect<void | { readonly contextDelivered: false }, ProviderAdapterV2Error>;
   readonly compactThread?: (
     input: ProviderAdapterV2TurnInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;

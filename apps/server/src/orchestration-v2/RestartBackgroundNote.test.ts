@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   MessageId,
+  ProviderDriverKind,
   ProviderThreadId,
   RunAttemptId,
   RunId,
@@ -42,6 +43,11 @@ const turnFor = (source: OrchestrationV2Run) => ({
   runAttemptId: source.activeAttemptId,
   providerThreadId: source.providerThreadId!,
   status: "completed" as const,
+  nativeTurnRef: {
+    driver: ProviderDriverKind.make("codex"),
+    nativeId: `native:${source.id}`,
+    strength: "strong" as const,
+  },
 });
 
 it("keeps the note for the provider thread that lost the work across a provider switch", () => {
@@ -143,6 +149,7 @@ it("does not repeat the note when a steer restarts the run on a new attempt", ()
               {
                 runAttemptId: firstAttempt,
                 providerThreadId: claudeThread,
+                nativeTurnRef: turnFor(root).nativeTurnRef,
                 status: "completed" as const,
               },
             ]
@@ -157,6 +164,22 @@ it("does not repeat the note when a steer restarts the run on a new attempt", ()
   assert.deepEqual(pending([firstAttempt, RunAttemptId.make("attempt:2b")], true), []);
   // A first attempt that never reached the provider did not deliver it.
   assert.deepEqual(pending([firstAttempt, RunAttemptId.make("attempt:2b")], false), lost);
+});
+
+it("keeps pending notes after a native goal control starts no agent turn", () => {
+  const source = run(1, codexThread, { restartCancelledBackgroundWork: lost });
+  const control = run(2, codexThread);
+  const next = run(3, codexThread);
+  assert.deepEqual(
+    pendingRestartCancelledBackgroundWork({
+      runs: [source, control, next],
+      providerTurns: [turnFor(source), { ...turnFor(control), nativeTurnRef: null }],
+      compactionMessageIds: new Set(),
+      run: next,
+      attempts: [{ id: next.activeAttemptId!, runId: next.id }],
+    }),
+    lost,
+  );
 });
 
 it("counts a prompted mid-turn or chained continuation as delivering the note", () => {

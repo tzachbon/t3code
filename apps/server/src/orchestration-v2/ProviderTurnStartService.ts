@@ -210,7 +210,8 @@ export const layer: Layer.Layer<
         ...(session.compactThread === undefined
           ? {}
           : {
-              compactThread: (input: Parameters<typeof session.startTurn>[0]) => start(input, true),
+              compactThread: (input: Parameters<typeof session.startTurn>[0]) =>
+                start(input, true).pipe(Effect.asVoid),
             }),
       };
     };
@@ -251,12 +252,19 @@ export const layer: Layer.Layer<
                     source.status === "interrupted" ||
                     (source.status === "completed" &&
                       handoff.delivery === undefined &&
-                      projection.messages.some(
+                      (projection.messages.some(
                         (message) =>
                           message.id === source.userMessageId &&
                           message.attachments.length === 0 &&
                           message.text.trim().toLowerCase() === "/compact",
-                      ))),
+                      ) ||
+                        (providerThread?.driver === "codex" &&
+                          projection.providerTurns.some(
+                            (turn) =>
+                              turn.runAttemptId === source.activeAttemptId &&
+                              turn.status === "completed" &&
+                              turn.nativeTurnRef === null,
+                          ))))),
               ))),
       );
       const nativeForkTransfer = projection.contextTransfers.find(
@@ -951,6 +959,12 @@ export const layer: Layer.Layer<
         text: message.text,
         records: message.context?.records ?? [],
       });
+      const nativeGoalCommand =
+        session.driver === "codex" &&
+        message.attachments.length === 0 &&
+        /^\/goal(?:\s|$)/u.test(userText.trim());
+      const nativeGoalControl =
+        nativeGoalCommand && /^\/goal(?:\s+(?:edit|pause|clear))?$/iu.test(userText.trim());
       // Delivered once: this run's provider turn marks the work as told. A
       // restart continuation is prompted by its own text or resumes natively.
       const noteContinuation = isRestartNoteContinuation(
@@ -1120,7 +1134,7 @@ export const layer: Layer.Layer<
                 ];
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff],
-            deferInline: compact,
+            deferInline: compact || nativeGoalControl,
             providerThread: runningProviderThread,
             budget: Effect.gen(function* () {
               return handoffBudget({
@@ -1168,16 +1182,21 @@ export const layer: Layer.Layer<
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
-          const context = [delivery.context, restartNote]
+          const context = [delivery.context, nativeGoalControl ? "" : restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
           // A note continuation has no turn to resume; its text is the prompt.
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
-          yield* start({
+          const outcome = yield* start({
             ...(noteContinuation ? promptedInput : turnInput),
+            // Prefixing a native command hides it from the adapter's parser.
+            ...(nativeGoalCommand && context !== "" ? { untrustedContext: context } : {}),
             message: {
               ...turnInput.message,
-              text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,
+              text:
+                nativeGoalCommand || context === ""
+                  ? userText
+                  : `${context}\n\nUser message:\n${userText}`,
             },
           }).pipe(
             // A pending marker would make the next turn abandon this native
@@ -1194,11 +1213,10 @@ export const layer: Layer.Layer<
                 : Effect.void,
             ),
           );
-          // The provider already accepted the turn. A stale pending marker
-          // can force a fresh thread later, but must not stop live ingestion.
-          yield* delivery.delivered.pipe(
+          // Local command replies consume no inline history; leave it for the next prompt.
+          yield* (outcome?.contextDelivered === false ? delivery.unsent : delivery.delivered).pipe(
             Effect.catchCause(() =>
-              Effect.logWarning("Failed to record accepted context handoff delivery", {
+              Effect.logWarning("Failed to record context handoff delivery", {
                 runId: run.id,
                 deliveryStatus: "pending",
               }),

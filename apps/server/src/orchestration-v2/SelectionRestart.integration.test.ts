@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  ContextHandoffId,
   EventId,
   MessageId,
   type ModelSelection,
@@ -13,7 +14,7 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
-  type RunId,
+  RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -70,6 +71,8 @@ interface ActiveTurn {
 
 interface RestartAdapterState {
   readonly activeTurn: ActiveTurn | null;
+  readonly completeActiveTurn?: (() => Effect.Effect<void>) | undefined;
+  readonly steered?: ReadonlyArray<{ readonly text: string }>;
   readonly opened: ReadonlyArray<{
     readonly model: string | null;
     readonly cwd: string | null;
@@ -77,6 +80,11 @@ interface RestartAdapterState {
   readonly started: ReadonlyArray<{
     readonly model: string;
     readonly cwd: string | null;
+    readonly text: string;
+    readonly untrustedContext?: string;
+    readonly runtimeMode: string;
+    readonly interactionMode: string;
+    readonly restartContinuationOfRunId?: RunId;
     readonly attemptId: string;
   }>;
   readonly closedSessionCount: number;
@@ -148,7 +156,11 @@ function makeRestartAdapter(
           })),
         );
 
-        const publishTerminal = (active: ActiveTurn, status: "completed" | "interrupted") =>
+        const publishTerminal = (
+          active: ActiveTurn,
+          status: "completed" | "interrupted",
+          native = true,
+        ) =>
           Effect.gen(function* () {
             const occurredAt = yield* DateTime.now;
             yield* Queue.offer(events, {
@@ -159,11 +171,13 @@ function makeRestartAdapter(
                 providerThreadId: active.input.providerThread.id,
                 nodeId: active.input.rootNodeId,
                 runAttemptId: active.input.attemptId,
-                nativeTurnRef: {
-                  driver,
-                  nativeId: `native:${active.providerTurnId}`,
-                  strength: "strong",
-                },
+                nativeTurnRef: native
+                  ? {
+                      driver,
+                      nativeId: `native:${active.providerTurnId}`,
+                      strength: "strong",
+                    }
+                  : null,
                 ordinal: active.input.providerTurnOrdinal,
                 status,
                 startedAt: occurredAt,
@@ -223,6 +237,15 @@ function makeRestartAdapter(
                   {
                     model: input.modelSelection.model,
                     cwd: input.runtimePolicy.cwd,
+                    text: input.message.text,
+                    ...(input.untrustedContext === undefined
+                      ? {}
+                      : { untrustedContext: input.untrustedContext }),
+                    runtimeMode: input.runtimePolicy.runtimeMode,
+                    interactionMode: input.runtimePolicy.interactionMode,
+                    ...(input.restartContinuationOfRunId === undefined
+                      ? {}
+                      : { restartContinuationOfRunId: input.restartContinuationOfRunId }),
                     attemptId: input.attemptId,
                   },
                 ],
@@ -231,9 +254,27 @@ function makeRestartAdapter(
                 input,
                 providerTurnId: ProviderTurnId.make(`provider-turn:${input.attemptId}`),
               } satisfies ActiveTurn;
+              // A resume with no native goal replies locally and consumes no context.
+              if (input.message.text === "/goal resume") {
+                yield* publishTerminal(active, "completed", false);
+                return { contextDelivered: false } as const;
+              }
               if (input.modelSelection.model === initialSelection.model) {
                 const occurredAt = yield* DateTime.now;
-                yield* Ref.update(state, (current) => ({ ...current, activeTurn: active }));
+                const completeActiveTurn = () =>
+                  Effect.gen(function* () {
+                    yield* publishTerminal(active, "completed");
+                    yield* Ref.update(state, (current) => ({
+                      ...current,
+                      activeTurn: null,
+                      completeActiveTurn: undefined,
+                    }));
+                  });
+                yield* Ref.update(state, (current) => ({
+                  ...current,
+                  activeTurn: active,
+                  completeActiveTurn,
+                }));
                 yield* Queue.offer(events, {
                   type: "provider_turn.updated",
                   driver,
@@ -257,7 +298,11 @@ function makeRestartAdapter(
               }
               yield* publishTerminal(active, "completed");
             }),
-          steerTurn: () => Effect.void,
+          steerTurn: (input) =>
+            Ref.update(state, (current) => ({
+              ...current,
+              steered: [...(current.steered ?? []), { text: input.message.text }],
+            })),
           interruptTurn: () =>
             Effect.gen(function* () {
               const active = (yield* Ref.get(state)).activeTurn;
@@ -273,7 +318,11 @@ function makeRestartAdapter(
                   },
                 });
                 yield* publishTerminal(active, "interrupted");
-                yield* Ref.update(state, (current) => ({ ...current, activeTurn: null }));
+                yield* Ref.update(state, (current) => ({
+                  ...current,
+                  activeTurn: null,
+                  completeActiveTurn: undefined,
+                }));
               }
             }),
           respondToRuntimeRequest: () => Effect.void,
@@ -545,6 +594,374 @@ it.live("retries a failed selection restart session open before completing", () 
         projection.providerSessions.find((session) => session.model === replacementSelection.model)
           ?.id,
       );
+    }),
+  ),
+);
+
+it.live("routes active goals through native steer and queue paths", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = "native-goal-dispatch";
+      const cwd = yield* checkpointWorkspace(name);
+      const threadId = ThreadId.make(`thread:${name}`);
+      const state = yield* Ref.make<RestartAdapterState>({
+        activeTurn: null,
+        opened: [],
+        started: [],
+        closedSessionCount: 0,
+        failedReplacementOpen: true,
+      });
+      const layerRegistry = ProviderAdapterRegistry.layerSingle(makeRestartAdapter(state));
+
+      const result = yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const watchRunningTurn = (
+          filter: { readonly runId?: RunId; readonly attemptId?: string | null } = {},
+        ) =>
+          Effect.gen(function* () {
+            return yield* eventSink
+              .stream({ threadId, afterSequence: yield* eventSink.latestSequence({ threadId }) })
+              .pipe(
+                Stream.map((stored) => stored.event),
+                Stream.filter(
+                  (event) =>
+                    event.type === "provider-turn.updated" &&
+                    event.payload.status === "running" &&
+                    (filter.runId === undefined || event.runId === filter.runId) &&
+                    (filter.attemptId === undefined ||
+                      event.payload.runAttemptId === filter.attemptId),
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+          });
+        const submit = (
+          step: string,
+          text: string,
+          dispatchMode:
+            | { readonly type: "start_immediately" }
+            | { readonly type: "queue_after_active" }
+            | { readonly type: "steer_active"; readonly targetRunId: RunId },
+        ) =>
+          orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make(`command:${name}:${step}`),
+            threadId,
+            messageId: MessageId.make(`message:${name}:${step}`),
+            text,
+            attachments: [],
+            modelSelection: initialSelection,
+            dispatchMode,
+          });
+
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`command:${name}:create`),
+          threadId,
+          projectId: ProjectId.make(`project:${name}`),
+          title: "Native goal dispatch",
+          modelSelection: initialSelection,
+          runtimeMode: "auto-accept-edits",
+          interactionMode: "plan",
+          branch: null,
+          worktreePath: cwd,
+        });
+
+        const firstRunning = yield* watchRunningTurn();
+        yield* submit("busy", "Keep working until I send a new instruction.", {
+          type: "start_immediately",
+        });
+        yield* Fiber.join(firstRunning);
+        yield* worker.drain();
+
+        const goalText = "/goal finish the requested task";
+        yield* submit("queued-goal", goalText, { type: "queue_after_active" });
+        yield* worker.drain();
+        const queuedProjection = yield* orchestrator.getThreadProjection(threadId);
+        const queuedGoal = queuedProjection.runs.find((run) => run.status === "queued");
+        assert.isDefined(queuedGoal);
+        assert.equal(
+          queuedProjection.messages.find((message) => message.id === queuedGoal.userMessageId)
+            ?.text,
+          goalText,
+        );
+        assert.deepEqual(
+          (yield* Ref.get(state)).started.map((turn) => turn.text),
+          ["Keep working until I send a new instruction."],
+        );
+
+        const queuedGoalStarted = yield* watchRunningTurn({
+          attemptId: queuedGoal.activeAttemptId,
+        });
+        const busyRun = queuedProjection.runs.find((run) => run.status === "running");
+        assert.isDefined(busyRun);
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`event:${name}:cancelled-background-work`),
+              type: "run.updated",
+              threadId,
+              runId: busyRun.id,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...busyRun,
+                restartCancelledBackgroundWork: [{ kind: "subagent", label: "Background check" }],
+              },
+            },
+          ],
+        });
+        const finishBusyTurn = (yield* Ref.get(state)).completeActiveTurn;
+        if (finishBusyTurn === undefined) {
+          return yield* Effect.die("busy adapter turn has no completion handle");
+        }
+        yield* finishBusyTurn();
+        yield* Fiber.join(queuedGoalStarted);
+        yield* worker.drain();
+        const activeGoalProjection = yield* orchestrator.getThreadProjection(threadId);
+        const activeGoalRun = activeGoalProjection.runs.find((run) => run.id === queuedGoal.id);
+        assert.isDefined(activeGoalRun);
+        assert.equal(activeGoalRun?.status, "running");
+        assert.equal((yield* Ref.get(state)).started[1]?.text, goalText);
+        assert.include((yield* Ref.get(state)).started[1]?.untrustedContext, "Background check");
+
+        const directGoalText = "/goal";
+        yield* submit("direct-goal-steer", directGoalText, {
+          type: "steer_active",
+          targetRunId: queuedGoal.id,
+        });
+        yield* worker.drain();
+        const afterDirectGoal = yield* orchestrator.getThreadProjection(threadId);
+        const afterDirectGoalState = yield* Ref.get(state);
+        assert.equal(
+          afterDirectGoal.runs.find((run) => run.id === queuedGoal.id)?.activeAttemptId,
+          activeGoalRun?.activeAttemptId,
+        );
+        assert.deepEqual(
+          afterDirectGoalState.steered?.map((turn) => turn.text),
+          [directGoalText],
+        );
+        assert.lengthOf(afterDirectGoalState.started, 2);
+
+        const promotedGoalText = "/goal edit";
+        yield* submit("queued-goal-promotion", promotedGoalText, { type: "queue_after_active" });
+        yield* worker.drain();
+        const beforePromotion = yield* orchestrator.getThreadProjection(threadId);
+        const queuedGoalToPromote = beforePromotion.runs.find((run) => run.status === "queued");
+        assert.isDefined(queuedGoalToPromote);
+        assert.lengthOf((yield* Ref.get(state)).started, 2);
+        yield* orchestrator.dispatch({
+          type: "queued-message.promote-to-steer",
+          commandId: CommandId.make(`command:${name}:promote-goal`),
+          threadId,
+          queuedRunId: queuedGoalToPromote.id,
+          targetRunId: queuedGoal.id,
+        });
+        yield* worker.drain();
+        const afterPromotion = yield* orchestrator.getThreadProjection(threadId);
+        const afterPromotionState = yield* Ref.get(state);
+        assert.equal(
+          afterPromotion.runs.find((run) => run.id === queuedGoal.id)?.activeAttemptId,
+          activeGoalRun?.activeAttemptId,
+        );
+        assert.equal(
+          afterPromotion.runs.find((run) => run.id === queuedGoalToPromote.id)?.status,
+          "cancelled",
+        );
+        assert.deepEqual(
+          afterPromotionState.steered?.map((turn) => turn.text),
+          [directGoalText, promotedGoalText],
+        );
+        assert.lengthOf(afterPromotionState.started, 2);
+        assert.equal(afterPromotion.thread.modelSelection.model, initialSelection.model);
+        assert.equal(afterPromotion.thread.runtimeMode, "auto-accept-edits");
+        assert.equal(afterPromotion.thread.interactionMode, "plan");
+
+        const compactDispatchError = yield* submit("compact-rejected", "/compact", {
+          type: "steer_active",
+          targetRunId: queuedGoal.id,
+        }).pipe(Effect.flip);
+        assert.instanceOf(compactDispatchError, Orchestrator.OrchestratorDispatchError);
+        assert.equal(
+          compactDispatchError.cause,
+          "Context compaction must run as a separate turn. Queue it or wait for the active turn to finish.",
+        );
+
+        const ordinarySteerText = "Add a check for the empty-input case.";
+        yield* submit("ordinary-steer", ordinarySteerText, {
+          type: "steer_active",
+          targetRunId: queuedGoal.id,
+        });
+        yield* worker.drain();
+        const afterSteer = yield* orchestrator.getThreadProjection(threadId);
+        const afterSteerState = yield* Ref.get(state);
+        assert.equal(
+          afterSteer.runs.find((run) => run.id === queuedGoal.id)?.activeAttemptId,
+          activeGoalRun?.activeAttemptId,
+        );
+        assert.deepEqual(
+          afterSteerState.steered?.map((turn) => turn.text),
+          [directGoalText, promotedGoalText, ordinarySteerText],
+        );
+        assert.lengthOf(afterSteerState.started, 2);
+
+        const queuedText = "Continue after the native goal finishes.";
+        yield* submit("ordinary-queued", queuedText, { type: "queue_after_active" });
+        yield* worker.drain();
+        const waitingProjection = yield* orchestrator.getThreadProjection(threadId);
+        const queuedOrdinary = waitingProjection.runs.find((run) => run.status === "queued");
+        assert.isDefined(queuedOrdinary);
+        assert.equal((yield* Ref.get(state)).started.length, 2);
+
+        const queuedOrdinaryStarted = yield* watchRunningTurn({
+          attemptId: queuedOrdinary.activeAttemptId,
+        });
+        const finishGoalTurn = (yield* Ref.get(state)).completeActiveTurn;
+        if (finishGoalTurn === undefined) {
+          return yield* Effect.die("native goal adapter turn has no completion handle");
+        }
+        yield* finishGoalTurn();
+        yield* Fiber.join(queuedOrdinaryStarted);
+        yield* worker.drain();
+        const beforeGoalMutation = yield* orchestrator.getThreadProjection(threadId);
+        const queuedOrdinaryRun = beforeGoalMutation.runs.find(
+          (run) => run.id === queuedOrdinary.id,
+        );
+        assert.isDefined(queuedOrdinaryRun);
+        const marker = RunId.make(`run:${name}:restart-continuation-marker`);
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`event:${name}:restart-continuation-marker`),
+              type: "run.updated",
+              threadId,
+              runId: queuedOrdinary.id,
+              occurredAt: now,
+              payload: { ...queuedOrdinaryRun, restartContinuationOfRunId: marker },
+            },
+          ],
+        });
+        const changedGoalRunning = yield* watchRunningTurn({ runId: queuedOrdinary.id });
+        const changedGoalText = "/goal changed objective";
+        yield* submit("goal-mutation", changedGoalText, {
+          type: "steer_active",
+          targetRunId: queuedOrdinary.id,
+        });
+        yield* worker.drain();
+        yield* Fiber.join(changedGoalRunning);
+        yield* worker.drain();
+
+        const finalProjection = yield* orchestrator.getThreadProjection(threadId);
+        const restartedRun = finalProjection.runs.find((run) => run.id === queuedOrdinary.id);
+        const finalState = yield* Ref.get(state);
+        assert.notEqual(restartedRun?.activeAttemptId, queuedOrdinaryRun?.activeAttemptId);
+        assert.equal(restartedRun?.userMessageId, MessageId.make(`message:${name}:goal-mutation`));
+        assert.isUndefined(restartedRun?.restartContinuationOfRunId);
+        assert.equal(finalState.started[3]?.text, changedGoalText);
+        assert.isUndefined(finalState.started[3]?.restartContinuationOfRunId);
+        assert.equal(
+          finalProjection.runs.find((run) => run.id === queuedOrdinary.id)?.status,
+          "running",
+        );
+        assert.deepEqual(
+          finalState.started.map((turn) => turn.text),
+          ["Keep working until I send a new instruction.", goalText, queuedText, changedGoalText],
+        );
+        assert.deepEqual(
+          finalState.steered?.map((turn) => turn.text),
+          [directGoalText, promotedGoalText, ordinarySteerText],
+        );
+        assert.deepEqual(
+          finalState.started.map((turn) => [
+            turn.model,
+            turn.cwd,
+            turn.runtimeMode,
+            turn.interactionMode,
+          ]),
+          Array.from({ length: 4 }, () => [
+            initialSelection.model,
+            cwd,
+            "auto-accept-edits",
+            "plan",
+          ]),
+        );
+
+        const providerThread = finalProjection.providerThreads.find(
+          (candidate) => candidate.id === restartedRun?.providerThreadId,
+        );
+        assert.isDefined(providerThread);
+        const handoffId = ContextHandoffId.make(`handoff:${name}:missing-goal`);
+        const handoffText = "Context must survive a missing goal.";
+        const handoffTime = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`event:${name}:missing-goal-handoff`),
+              type: "context-handoff.updated",
+              threadId,
+              runId: queuedOrdinary.id,
+              occurredAt: handoffTime,
+              payload: {
+                id: handoffId,
+                threadId,
+                targetRunId: queuedOrdinary.id,
+                fromProviderThreadIds: [providerThread.id],
+                toProviderThreadId: providerThread.id,
+                coveredRunOrdinals: { from: 1, to: 3 },
+                strategy: "manual_context",
+                status: "ready",
+                summaryMessageId: null,
+                summaryText: handoffText,
+                createdByProviderInstanceId: providerInstanceId,
+                createdAt: handoffTime,
+                updatedAt: handoffTime,
+              },
+            },
+          ],
+        });
+        const resumeCompleted = yield* eventSink
+          .stream({
+            threadId,
+            afterSequence: yield* eventSink.latestSequence({ threadId }),
+          })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "run.updated" &&
+                stored.event.payload.id === queuedOrdinary.id &&
+                stored.event.payload.status === "completed",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+        yield* submit("resume-missing-goal", "/goal resume", {
+          type: "steer_active",
+          targetRunId: queuedOrdinary.id,
+        });
+        yield* Fiber.join(resumeCompleted);
+        yield* worker.drain();
+        const afterResume = yield* orchestrator.getThreadProjection(threadId);
+        assert.isUndefined(
+          afterResume.contextHandoffs.find((handoff) => handoff.id === handoffId)?.delivery,
+        );
+        const followupRunning = yield* watchRunningTurn();
+        yield* submit("after-missing-goal", "Continue with the saved context.", {
+          type: "start_immediately",
+        });
+        yield* Fiber.join(followupRunning);
+        yield* worker.drain();
+        assert.include((yield* Ref.get(state)).started.at(-1)?.text, handoffText);
+      }).pipe(Effect.provide(ProviderReplayHarness.layerWithRegistry({ name }, layerRegistry)));
+
+      assert.equal(result, undefined);
     }),
   ),
 );

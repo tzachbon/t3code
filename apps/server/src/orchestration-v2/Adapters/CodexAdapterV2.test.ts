@@ -1605,6 +1605,9 @@ function codexReplayPreamble(input: {
   readonly prompt: string;
   /** Text the adapter should send, when it differs from what the user typed. */
   readonly sentPrompt?: string;
+  readonly additionalContext?: Readonly<
+    Record<string, { readonly kind: "untrusted"; readonly value: string }>
+  >;
 }): Array<CodexReplay.CodexAppServerReplayEntry> {
   return [
     {
@@ -1696,6 +1699,9 @@ function codexReplayPreamble(input: {
         params: {
           threadId: input.nativeThreadId,
           input: [{ type: "text", text: input.sentPrompt ?? input.prompt }],
+          ...(input.additionalContext === undefined
+            ? {}
+            : { additionalContext: input.additionalContext }),
           cwd: "/workspace",
           model: "gpt-5.4",
           approvalPolicy: "never",
@@ -1961,6 +1967,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       Effect.void,
     onRequest: (method: string, params: unknown) => Effect.Effect<void> = () => Effect.void,
     readChildMetadata?: Parameters<typeof withCodexReplayChildMetadata>[2],
+    beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"],
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -1968,9 +1975,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       const serverConfig = yield* makeReplayServerConfig(transcript.scenario).pipe(Effect.orDie);
       const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
         [];
+      const driver = yield* CodexReplay.makeReplayDriver(
+        transcript,
+        beforeEmitInbound === undefined ? {} : { beforeEmitInbound },
+      );
       const clientFactory: CodexAdapterV2.CodexAppServerClientFactoryShape = {
         open: (openInput) =>
-          Layer.build(CodexReplay.layerReplay(transcript)).pipe(
+          Layer.build(CodexReplay.layerReplayWithDriver(driver)).pipe(
             Effect.mapError(
               (cause) =>
                 new ProviderAdapter.ProviderAdapterOpenSessionError({
@@ -8382,8 +8393,148 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.isNull(CodexAdapterV2.parseCodexGoalCommand("set a /goal"));
     });
 
+    it.effect.each(["active", "held"] as const)(
+      "shows /goal while %s without steering or ending the run",
+      (state) =>
+        Effect.gen(function* () {
+          const reply = yield* Deferred.make<void>();
+          const ready = yield* Deferred.make<void>();
+          const transcript = makeCodexReplayTranscript({
+            scenario: `goal-status-steer-${state}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: "busy-turn",
+                prompt: "Keep working",
+              }),
+              notification("goal active", "thread/goal/updated", {
+                threadId: nativeThreadId,
+                turnId: "busy-turn",
+                goal: codexGoal("active", 10),
+              }),
+              ...(state === "held"
+                ? [
+                    notification("turn done", "turn/completed", {
+                      threadId: nativeThreadId,
+                      turn: makeCodexReplayTurn({ id: "busy-turn", status: "completed" }),
+                    }),
+                    notification("goal accounted", "thread/goal/updated", {
+                      threadId: nativeThreadId,
+                      turnId: null,
+                      goal: codexGoal("active", 11),
+                    }),
+                  ]
+                : []),
+              ...request(
+                4,
+                "thread/goal/get",
+                { threadId: nativeThreadId },
+                {
+                  goal: codexGoal("active", 10),
+                },
+              ),
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript, (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.goal?.tokensUsed === (state === "held" ? 11 : 10)
+              ? Deferred.succeed(ready, undefined)
+              : event.type === "message.updated" && event.message.role === "assistant"
+                ? Deferred.succeed(reply, undefined)
+                : Effect.void,
+          );
+          const turnInput = yield* goalTurnInput(harness, "Keep working");
+          yield* harness.runtime.startTurn(turnInput);
+          yield* Deferred.await(ready);
+          yield* harness.runtime.steerTurn({
+            threadId: harness.threadId,
+            runId: turnInput.runId,
+            providerThread: harness.providerThread,
+            providerTurnId: (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+              driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+              nativeTurnId: "busy-turn",
+            }),
+            message: {
+              ...turnInput.message,
+              messageId: MessageId.make("goal-status-message"),
+              text: "/goal",
+            },
+          });
+          yield* Deferred.await(reply);
+          assert.lengthOf(harness.terminalEvents(), 0);
+          assert.include(assistantMessages(harness.events).at(-1)?.message.text, objective);
+          assert.include(assistantMessages(harness.events).at(-1)?.message.text, "active");
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+    );
+
+    it.effect("rejects a status steer when its turn finishes during goal/get", () =>
+      Effect.gen(function* () {
+        const ready = yield* Deferred.make<void>();
+        const settled = yield* Deferred.make<void>();
+        const query = request(4, "thread/goal/get", { threadId: nativeThreadId }, { goal: null });
+        const transcript = makeCodexReplayTranscript({
+          scenario: "goal-status-completion-race",
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId,
+              nativeTurnId: "busy-turn",
+              prompt: "Keep working",
+            }),
+            query[0]!,
+            notification("turn done during query", "turn/completed", {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "busy-turn", status: "completed" }),
+            }),
+            { ...query[1]!, label: "status after completion" },
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running"
+              ? Deferred.succeed(ready, undefined)
+              : event.type === "turn.terminal"
+                ? Deferred.succeed(settled, undefined)
+                : Effect.void,
+          undefined,
+          undefined,
+          (entry) =>
+            entry.label === "status after completion" ? Deferred.await(settled) : Effect.void,
+        );
+        const turnInput = yield* goalTurnInput(harness, "Keep working");
+        yield* harness.runtime.startTurn(turnInput);
+        yield* Deferred.await(ready);
+        const result = yield* harness.runtime
+          .steerTurn({
+            threadId: harness.threadId,
+            runId: turnInput.runId,
+            providerThread: harness.providerThread,
+            providerTurnId: (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+              driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+              nativeTurnId: "busy-turn",
+            }),
+            message: { ...turnInput.message, text: "/goal" },
+          })
+          .pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        assert.lengthOf(assistantMessages(harness.events), 0);
+        assert.lengthOf(harness.terminalEvents(), 1);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    );
+
     it.effect("keeps a /goal run open across the turns Codex continues on its own", () =>
       Effect.gen(function* () {
+        const continued = yield* Deferred.make<void>();
         const transcript = makeCodexReplayTranscript({
           scenario: "goal-continuation",
           entries: [
@@ -8401,6 +8552,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 nativeThreadId,
                 nativeTurnId: "goal-turn-1",
                 prompt: objective,
+                additionalContext: {
+                  t3_code_turn_context: {
+                    kind: "untrusted",
+                    value: "Interrupted background check",
+                  },
+                },
               }).slice(5),
               5,
             ),
@@ -8423,6 +8580,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               threadId: nativeThreadId,
               turn: makeCodexReplayTurn({ id: "goal-turn-2", status: "inProgress" }),
             }),
+            ...request(
+              7,
+              "turn/steer",
+              {
+                threadId: nativeThreadId,
+                expectedTurnId: "goal-turn-2",
+                input: [{ type: "text", text: "Keep the output small." }],
+              },
+              { turnId: "goal-turn-2" },
+            ),
             notification("goal complete", "thread/goal/updated", {
               threadId: nativeThreadId,
               turnId: "goal-turn-2",
@@ -8434,16 +8601,37 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             }),
           ],
         });
-        const harness = yield* makeCodexReplayHarness(transcript);
-        yield* harness.runtime.startTurn(yield* goalTurnInput(harness, `/goal ${objective}`));
-        yield* harness.firstTerminal;
-
         const idAllocator = yield* IdAllocator.IdAllocatorV2;
         const providerTurnId = (nativeTurnId: string) =>
           idAllocator.derive.providerTurn({
             driver: CodexAdapterV2.CODEX_DRIVER_KIND,
             nativeTurnId,
           });
+        const harness = yield* makeCodexReplayHarness(transcript, (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.id === providerTurnId("goal-turn-2") &&
+          event.providerTurn.status === "running"
+            ? Deferred.succeed(continued, undefined)
+            : Effect.void,
+        );
+        const turnInput = {
+          ...(yield* goalTurnInput(harness, `/goal ${objective}`)),
+          untrustedContext: "Interrupted background check",
+        };
+        yield* harness.runtime.startTurn(turnInput);
+        yield* Deferred.await(continued);
+        yield* harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: turnInput.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: providerTurnId("goal-turn-1"),
+          message: {
+            ...turnInput.message,
+            messageId: MessageId.make("continued-steer"),
+            text: "Keep the output small.",
+          },
+        });
+        yield* harness.firstTerminal;
         assert.deepEqual(
           harness.terminalEvents().map((event) => [event.providerTurnId, event.status]),
           [[providerTurnId("goal-turn-2"), "completed"]],
@@ -8466,6 +8654,32 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           ],
         );
         assert.equal(providerGoals(harness.events).at(-1), "complete");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    );
+
+    it.effect("does not report context delivered when /goal resume has no goal", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: "goal-resume-missing",
+            entries: [
+              ...sessionStart,
+              ...request(3, "thread/goal/get", { threadId: nativeThreadId }, { goal: null }),
+            ],
+          }),
+        );
+        const outcome = yield* harness.runtime.startTurn({
+          ...(yield* goalTurnInput(harness, "/goal resume")),
+          untrustedContext: "History that still needs delivery",
+        });
+        yield* harness.firstTerminal;
+        assert.deepEqual(outcome, { contextDelivered: false });
+        assert.equal(assistantMessages(harness.events).at(-1)?.message.text, "No goal is set.");
       }).pipe(
         Effect.scoped,
         Effect.provide(

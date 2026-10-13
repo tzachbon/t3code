@@ -726,6 +726,7 @@ export function buildCodexTurnStartParams(input: {
   readonly omitServiceTier?: boolean;
   /** What the thread's MCP Apps want the agent to know (`ui/update-model-context`). */
   readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
+  readonly untrustedContext?: string;
 }) {
   return Effect.gen(function* () {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
@@ -771,9 +772,20 @@ export function buildCodexTurnStartParams(input: {
           )
         : undefined;
     const additionalContext =
-      t3Context === undefined && Object.keys(appContext).length === 0
+      t3Context === undefined && Object.keys(appContext).length === 0 && !input.untrustedContext
         ? undefined
-        : { ...t3Context, ...appContext };
+        : {
+            ...t3Context,
+            ...appContext,
+            ...(input.untrustedContext
+              ? {
+                  t3_code_turn_context: {
+                    kind: "untrusted" as const,
+                    value: input.untrustedContext,
+                  },
+                }
+              : {}),
+          };
     const collaborationMode: CodexSchema.ClientRequest__CollaborationMode | undefined =
       input.runtimePolicy.interactionMode !== "plan" && developerInstructions === undefined
         ? undefined
@@ -6100,6 +6112,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             failure: null,
             threadDisposition: "reusable",
           });
+          return { contextDelivered: false } as const;
         });
 
         /** The goal hold whose run still reports this provider turn as running. */
@@ -6208,6 +6221,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
               ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
+              ...(turnInput.untrustedContext === undefined
+                ? {}
+                : { untrustedContext: turnInput.untrustedContext }),
             });
             yield* Ref.update(pendingRootTurns, (current) => {
               const updated = new Map(current);
@@ -6660,6 +6676,56 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           steerTurn: (turnInput) =>
             Effect.gen(function* () {
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
+              if (
+                turnInput.message.attachments.length === 0 &&
+                parseCodexGoalCommand(turnInput.message.text)?.type === "show"
+              ) {
+                const { goal } = yield* client.request("thread/goal/get", { threadId });
+                // The query can outlive its turn. Recheck and emit before terminalization.
+                return yield* turnTerminalizationPermit.withPermits(1)(
+                  Effect.gen(function* () {
+                    const latestTurnId = latestGoalTurnId(turnInput.providerTurnId);
+                    const held = heldGoalTurn(turnInput.providerThread, latestTurnId);
+                    const context =
+                      held?.hold.context ??
+                      Array.from((yield* Ref.get(activeTurns)).values()).find(
+                        (candidate) => candidate.providerTurnId === latestTurnId,
+                      );
+                    if (context === undefined) {
+                      return yield* toProtocolError(
+                        `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
+                      );
+                    }
+                    const current = goal == null ? null : providerGoalFromCodex(goal);
+                    goalsByNativeThread.set(threadId, current);
+                    yield* emitGoalUpdate(threadId);
+                    // A status reply belongs to the running turn; it must not settle it.
+                    const artifacts = yield* buildAgentMessageArtifacts(
+                      context,
+                      {
+                        id: `goal-status:${turnInput.message.messageId}`,
+                        text: current === null ? "No goal is set." : describeCodexGoal(current),
+                      },
+                      true,
+                    );
+                    yield* emitProviderEvent({
+                      type: "node.updated",
+                      driver: CODEX_PROVIDER,
+                      node: artifacts.node,
+                    });
+                    yield* emitProviderEvent({
+                      type: "message.updated",
+                      driver: CODEX_PROVIDER,
+                      message: artifacts.message,
+                    });
+                    yield* emitProviderEvent({
+                      type: "turn_item.updated",
+                      driver: CODEX_PROVIDER,
+                      turnItem: artifacts.turnItem,
+                    });
+                  }),
+                );
+              }
               // Between goal turns, steer the turn Codex continues with.
               const latestTurnId = latestGoalTurnId(turnInput.providerTurnId);
               const held = heldGoalTurn(turnInput.providerThread, latestTurnId);

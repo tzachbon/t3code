@@ -421,7 +421,7 @@ export function isNativeMaintenanceCommand(message: {
   );
 }
 
-/** A native `/goal` command. It changes the provider's goal, so it never steers a running turn. */
+/** An attachment-free native `/goal` command, including a status query. */
 function isGoalCommand(message: {
   readonly text: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
@@ -3831,14 +3831,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               : "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.",
         });
       }
-      if (isGoalCommand(input)) {
-        return yield* new OrchestratorDispatchError({
-          commandId: input.command.commandId,
-          commandType: input.command.type,
-          cause:
-            "Goal commands must run as a separate turn. Queue it or wait for the active turn to finish.",
-        });
-      }
       const targetMessage = input.projection.messages.find(
         (message) => message.id === targetRun.userMessageId,
       );
@@ -4039,6 +4031,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           capabilities: session.providerSession.capabilities,
           forceRestart:
             input.forceRestart ||
+            // Codex applies goal mutations in startTurn; status queries stay in place.
+            (providerThread.driver === "codex" &&
+              isGoalCommand(input) &&
+              !/^\/goal(?:\s+edit)?$/iu.test(input.text.trim())) ||
             selectionMustApplyNow ||
             (selectionChanged &&
               turnCapabilities.supportsInterrupt &&
@@ -4331,6 +4327,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       const restartedRun: OrchestrationV2Run = {
         ...targetRun,
+        // An explicit goal command supersedes an automatic native continuation.
+        ...(isGoalCommand(input) ? { restartContinuationOfRunId: undefined } : {}),
         providerInstanceId: input.modelSelection.instanceId,
         modelSelection: input.modelSelection,
         providerThreadId: restartProviderThread.id,

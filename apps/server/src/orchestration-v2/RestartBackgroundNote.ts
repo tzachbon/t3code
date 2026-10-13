@@ -98,7 +98,7 @@ export function restartCancelledBackgroundWorkNote(work: ReadonlyArray<Work>): s
 
 type ProviderTurnState = Pick<
   OrchestrationV2ProviderTurn,
-  "runAttemptId" | "providerThreadId" | "status"
+  "runAttemptId" | "providerThreadId" | "status" | "nativeTurnRef"
 >;
 
 /**
@@ -218,7 +218,13 @@ export function pendingRestartCancelledBackgroundWork(input: {
   const providerThreadId = input.run.providerThreadId;
   const deliveredAttemptIds = new Set(
     input.providerTurns
-      .filter((turn) => turn.providerThreadId === providerThreadId && turn.status === "completed")
+      // Native goal controls reply locally without delivering a prompt or its note.
+      .filter(
+        (turn) =>
+          turn.providerThreadId === providerThreadId &&
+          turn.status === "completed" &&
+          turn.nativeTurnRef !== null,
+      )
       .map((turn) => turn.runAttemptId),
   );
   const sameThread = input.runs.filter((run) => run.providerThreadId === providerThreadId);
