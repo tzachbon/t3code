@@ -1,30 +1,28 @@
 # Coding standards
 
+## A note from Theo
+
+The why behind everything below: ambitious ideas, simple systems, software that feels obvious. Find the real constraint, then fight for the smallest model that makes the correct behavior unsurprising: measure twice, cut once, and yagni. Existing complexity earns no protection and new machinery needs a real constraint. Honor the developer's intent minimally and realistically; fight scope creep.
+
 ## What makes T3 Code special?
 
-We have over 400,000 users who love T3 Code. It's important we maintain the things they love as we continue to iterate on the product. Here's a brief list of the things we can never compromise on.
+Over 400,000 users love T3 Code. These are the things we never compromise on.
 
 ### 1. Open at the core
 
-T3 Code is truly open. We share our roadmap, we share how we think about things, and of course we share all our code. A large number of our users run forks. We work in the open, and should strive to stay that way.
+We share our roadmap, our thinking and all our code, and many users run forks. Work stays in the open.
 
 ### 2. Performance without compromise
 
-Lots of apps have gotten bogged down with bad tech decisions and "slop". We have not, and we're proud of the performance of T3 Code. We regularly audit for performance regressions, often caused by sending too much data over websockets, css animations causing gpu spikes, lists being hard to render, and more.
+We audit for performance regressions, often caused by sending too much data over websockets, css animations causing gpu spikes, lists being hard to render, and more.
 
 ### 3. Remote ready
 
-The architecture of T3 Code's websocket layer (npx t3) enables a lot of awesome remote features. These have become core to the product. Whether users are connecting directly over their local network, using Tailscale, or leaning in fully with T3 Connect (our tunnel solution, also in this repo), we need to make sure new features are properly supported.
+The websocket layer (`npx t3`) makes remote use core to the product. New features work whether users connect over their local network, Tailscale, or T3 Connect (our tunnel, also in this repo).
 
 ### 4. Multi-surface
 
-T3 Code has 3 key app surfaces: **web**, **desktop**, and **mobile**.
-
-**Web** is kind of two surfaces, as we have the public facing "app.t3.codes" as well as locally hosting the web app through the `npx t3` command. Both need to be supported by all new features where reasonable.
-
-**Desktop** is the main surface most users install first. It's a full Electron app that bundles the server runner as well. The desktop app can also be used as the host server, allowing remote connections from app.t3.codes or the mobile app.
-
-**Mobile** is a React Native app for both iOS and Android, available on the App Store and Google Play. The mobile app allows for connecting to any T3 Code server to control work remotely.
+Every feature supports **web** (the public app.t3.codes and the web app `npx t3` hosts locally, where reasonable), **desktop** (the Electron app most users install first; it bundles the server and can host remote connections from app.t3.codes or mobile) and **mobile** (React Native on iOS and Android, controlling any T3 Code server remotely).
 
 ## Hit every surface
 
@@ -43,7 +41,7 @@ The most common defect in this repo is a change that works on the path you teste
 
 Clients send typed WebSocket requests. The server turns them into _commands_. The _orchestrator_ (`apps/server/src/orchestration-v2/Orchestrator.ts`) serializes commands and decides _events_ without doing any I/O. The _event sink_ commits those events, the _projections_ the UI reads, the _command receipt_, and _outbox_ effects in one transaction. The _effect worker_ then runs the effects, such as starting a provider turn or capturing a checkpoint, and feeds results back as commands. Provider CLIs run as subprocesses; per-provider _adapters_ translate their native protocols into orchestration events. Each turn ends with a _checkpoint_, a hidden git ref, so the app can diff and restore.
 
-Architecture and its constraints: `docs/internals/overview.md`. Glossary: `docs/internals/glossary.md`
+Architecture and its constraints: `docs/internals/overview.md`.
 
 ## Where code lives
 
@@ -70,3 +68,11 @@ Architecture and its constraints: `docs/internals/overview.md`. Glossary: `docs/
 - Test meaningful logic or observable behavior. Do not render components to static markup to assert props or attributes, or add tests that merely assert callback wiring or mirror the implementation.
 - Backend behavior changes ship with focused tests for that behavior.
 - The server is event-sourced, and side effects run after the command commits. In tests, drain the effect worker (`OrchestrationEffectWorkerV2.drain`) or await the specific persisted event or `Deferred` that marks the milestone. Never wait on sleeps or polling. A test that needs a timeout to pass is wrong.
+
+## Pull requests and work artifacts
+
+- Open a PR only when the developer asks for one. One request is one PR; split only when the maintainer asks. Outside contributions follow the stricter [one problem per PR](CONTRIBUTING.md#one-problem) rule.
+- Title: see [AGENTS.md](AGENTS.md). Body: the problem in a sentence or two, then the fix, ending with the model and harness that did the work.
+- UI changes need before/after images; motion or timing needs a short video. Upload evidence to GitHub; PR-only screenshots and assets (such as `.github/pr-assets/`) stay out of commits.
+- Babysitting: poll checks and comments newer than the last push, verify each bot finding against the source, fix real ones, dismiss false positives with a written reason. Stay quiet when nothing is new; stop when the bots are green on the latest commit.
+- Plans, research notes and agent scratch files stay outside the worktree (`.plans/` is gitignored only as a legacy safety net). Track active maintainer work in the GitHub issue or project item that owns it; external proposals go to Ideas discussions per `CONTRIBUTING.md`. A merged PR is the implementation record: close or update its tracking item when the work lands.
