@@ -3,7 +3,7 @@
 ## Primitives
 
 Controls come from [`components/ui`](../../apps/web/src/components/ui).
-[AGENTS.md](../../AGENTS.md#taste) says how to use and extend them.
+[Coding standards](../../CODING_STANDARDS.md#taste) says how to use and extend them.
 
 Don't style a raw `<button>`, `<input>`, `<select>`, or `<textarea>` to look like a control a
 primitive provides. Raw elements are right when the element isn't that control: semantic rows, tabs,
